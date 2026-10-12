@@ -24,13 +24,19 @@ pipeline {
       }
     }
 
+    stage('Install Dependencies') {
+      steps {
+        sh 'npm ci'
+        sh 'cd backend && npm ci --legacy-peer-deps'
+      }
+    }
+
     stage('Validation') {
       steps {
         sh 'node --version'
         sh 'npm --version'
         sh 'npm run lint'
         sh 'npx tsc --noEmit'
-        sh 'cd backend && npm install --legacy-peer-deps'
         sh 'cd backend && npx prisma validate'
       }
     }

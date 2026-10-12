@@ -151,6 +151,7 @@ Before running the pipeline, install the Jenkins NodeJS plugin and add a NodeJS 
 Pipeline responsibilities:
 
 - checkout and branch metadata
+- install frontend and backend dependencies from their lockfiles
 - lint and validation
 - tests
 - SAST and dependency scanning
