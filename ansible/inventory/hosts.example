@@ -1,0 +1,5 @@
+[jenkins]
+jenkins-host ansible_host=203.0.113.10 ansible_user=ubuntu
+
+[agent]
+agent-1 ansible_host=10.0.1.20 ansible_user=ubuntu

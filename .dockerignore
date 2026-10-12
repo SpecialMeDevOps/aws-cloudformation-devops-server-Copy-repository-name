@@ -1,0 +1,17 @@
+node_modules
+.next
+.git
+.gitignore
+.env
+.env.*
+Dockerfile*
+backend/node_modules
+backend/dist
+npm-debug.log*
+terraform/.terraform
+terraform/*.tfstate*
+*.pem
+*.key
+*.crt
+*.pfx
+*.log

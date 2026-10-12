@@ -1,0 +1,19 @@
+---
+- name: Prepare a Jenkins host for CI/CD
+  hosts: jenkins
+  become: true
+  tasks:
+    - name: Ensure required OS packages are installed
+      ansible.builtin.apt:
+        name:
+          - curl
+          - git
+          - docker.io
+          - ca-certificates
+          - jq
+        state: present
+        update_cache: true
+
+    - name: Confirm Docker is available
+      ansible.builtin.command: docker --version
+      changed_when: false

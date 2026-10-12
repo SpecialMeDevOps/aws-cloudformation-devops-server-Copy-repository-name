@@ -1,0 +1,3 @@
+- name: Ensure Jenkins host is ready
+  ansible.builtin.debug:
+    msg: "Jenkins configuration is delegated to the approved environment-specific role and secret management flow."

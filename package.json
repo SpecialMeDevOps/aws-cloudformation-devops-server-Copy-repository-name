@@ -6,9 +6,17 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "node --experimental-strip-types --test tests/*.test.mjs",
+    "backend:install": "cd backend && npm install --legacy-peer-deps",
+    "backend:dev": "cd backend && npm run start:dev",
+    "backend:build": "cd backend && npm run build",
+    "docker:up": "docker compose up --build",
+    "docker:down": "docker compose down"
   },
   "dependencies": {
+    "framer-motion": "^14.0.0",
+    "lucide-react": "^1.54.0",
     "next": "16.4.0",
     "react": "19.3.0",
     "react-dom": "19.3.0"

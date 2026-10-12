@@ -1,0 +1,86 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  name          String
+  role          Role
+  avatarUrl     String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  projects      Project[]
+  assignedTasks Project[] @relation("ProjectAssignee")
+  otpCodes      OtpCode[]
+  sessions      Session[]
+  notifications Notification[]
+}
+
+enum Role {
+  CLIENT
+  TEAM
+  ADMIN
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model OtpCode {
+  id        String   @id @default(cuid())
+  userId    String
+  code      String
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Project {
+  id          String   @id @default(cuid())
+  title       String
+  summary     String
+  category    String
+  priority    String
+  budget      Int
+  deadline    DateTime
+  skills      String[]
+  status      ProjectStatus @default(NEW)
+  attachments Json?
+  clientId    String
+  assigneeId  String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  client      User     @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  assignee    User?    @relation("ProjectAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+}
+
+enum ProjectStatus {
+  NEW
+  REVIEWING
+  APPROVED
+  IN_PROGRESS
+  DELIVERED
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  title     String
+  message   String
+  tone      String
+  readAt    DateTime?
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
