@@ -146,6 +146,8 @@ Files created:
 
 - [Jenkinsfile](C:/Users/USER/OneDrive/Desktop/it-your-it-house/Jenkinsfile)
 
+Before running the pipeline, install the Jenkins NodeJS plugin and add a NodeJS installation named `NodeJS-22` under **Manage Jenkins → Tools**. The pipeline provisions that tool on the agent so `node` and `npm` are available in validation and build stages.
+
 Pipeline responsibilities:
 
 - checkout and branch metadata

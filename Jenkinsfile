@@ -1,6 +1,10 @@
 pipeline {
   agent any
 
+  tools {
+    nodejs 'NodeJS-22'
+  }
+
   environment {
     NODE_ENV = 'test'
     APP_NAME = 'it-your-it-house'
