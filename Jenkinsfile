@@ -37,6 +37,15 @@ pipeline {
         sh 'npm --version'
         sh 'npm run lint'
         sh 'npx tsc --noEmit'
+      }
+    }
+
+    stage('Prisma Validation') {
+      environment {
+        DATABASE_URL = 'postgresql://ci_user:ci_password@localhost:5432/ci_validation?schema=public'
+      }
+      steps {
+        sh 'cd backend && npx prisma generate'
         sh 'cd backend && npx prisma validate'
       }
     }

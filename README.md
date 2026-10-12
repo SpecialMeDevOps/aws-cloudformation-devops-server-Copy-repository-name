@@ -148,11 +148,14 @@ Files created:
 
 Before running the pipeline, install the Jenkins NodeJS plugin and add a NodeJS installation named `NodeJS-22` under **Manage Jenkins → Tools**. The pipeline provisions that tool on the agent so `node` and `npm` are available in validation and build stages.
 
+The Prisma validation stage uses a non-production PostgreSQL placeholder URL only to validate the schema and generate the Prisma Client; it does not connect to a database. Runtime and deployment environments must provide the real `DATABASE_URL` through a secure secret mechanism.
+
 Pipeline responsibilities:
 
 - checkout and branch metadata
 - install frontend and backend dependencies from their lockfiles
 - lint and validation
+- Prisma Client generation and schema validation with a CI-only URL
 - tests
 - SAST and dependency scanning
 - secret scanning
