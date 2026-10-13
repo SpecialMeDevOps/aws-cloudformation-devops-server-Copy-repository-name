@@ -15,7 +15,7 @@ export class ProjectsService {
       orderBy: { createdAt: 'desc' },
     });
 
-    return projects.map((project) => ({
+    return projects.map((project: (typeof projects)[number]) => ({
       id: project.id,
       title: project.title,
       summary: project.summary,
