@@ -32,6 +32,7 @@
     "typescript": "^5"
   },
   "overrides": {
+    "braces": "3.0.3",
     "fast-glob": "3.3.3",
     "micromatch": "4.0.8"
   }
