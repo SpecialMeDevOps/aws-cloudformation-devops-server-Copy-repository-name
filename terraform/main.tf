@@ -54,6 +54,7 @@ resource "aws_cloudformation_stack" "application" {
     AllowedWebIngressCidr  = var.allowed_web_ingress_cidr
     DbInstanceClass        = var.db_instance_class
     ServiceDesiredCount    = var.service_desired_count
+    S3ManagedPrefixListId  = var.s3_managed_prefix_list_id
     AmpRemoteWriteEndpoint = aws_cloudformation_stack.monitoring[0].outputs["RemoteWriteEndpoint"]
     AmpWorkspaceArn        = aws_cloudformation_stack.monitoring[0].outputs["WorkspaceArn"]
   }

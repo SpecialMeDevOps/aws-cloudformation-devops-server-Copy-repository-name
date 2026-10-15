@@ -78,6 +78,16 @@ variable "service_desired_count" {
   }
 }
 
+variable "s3_managed_prefix_list_id" {
+  description = "AWS-managed regional S3 prefix list ID used to restrict ECR layer download egress."
+  type        = string
+  default     = ""
+  validation {
+    condition     = !var.deploy_application || can(regex("^pl-[0-9a-f]+$", var.s3_managed_prefix_list_id))
+    error_message = "Application deployment requires the AWS-managed S3 prefix list ID for the selected region."
+  }
+}
+
 variable "monitoring_instance_role_name" {
   description = "Optional existing Jenkins EC2 role to receive scoped read-only ECS/CloudWatch monitoring permissions."
   type        = string

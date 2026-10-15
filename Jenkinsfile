@@ -125,11 +125,17 @@ pipeline {
 
     stage('Dependency Security') {
       steps {
-        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE', message: 'Frontend dependency audit reported high-severity findings or could not complete.') {
-          sh 'npm audit --audit-level=high'
+        sh 'mkdir -p reports/dependency-audit'
+        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', message: 'Frontend dependency audit reported critical findings or could not complete.') {
+          sh 'npm audit --audit-level=critical --json > reports/dependency-audit/frontend.json'
         }
-        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE', message: 'Backend dependency audit reported high-severity findings or could not complete.') {
-          sh 'cd backend && npm audit --audit-level=high'
+        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', message: 'Backend dependency audit reported critical findings or could not complete.') {
+          sh 'cd backend && npm audit --audit-level=critical --json > ../reports/dependency-audit/backend.json'
+        }
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: 'reports/dependency-audit/**', allowEmptyArchive: true
         }
       }
     }
@@ -287,6 +293,13 @@ pipeline {
           ).trim()
           if (!(env.AWS_ACCOUNT_ID ==~ /[0-9]{12}/)) {
             error('AWS caller identity did not return a 12-digit account ID.')
+          }
+          env.TF_VAR_s3_managed_prefix_list_id = sh(
+            script: "aws ec2 describe-managed-prefix-lists --filters Name=prefix-list-name,Values=com.amazonaws.${env.AWS_REGION}.s3 --query 'PrefixLists[0].PrefixListId' --output text",
+            returnStdout: true
+          ).trim()
+          if (!(env.TF_VAR_s3_managed_prefix_list_id ==~ /pl-[0-9a-f]+/)) {
+            error('AWS did not return the regional managed S3 prefix list ID.')
           }
         }
         sh '''
