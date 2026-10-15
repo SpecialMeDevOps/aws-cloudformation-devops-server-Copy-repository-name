@@ -21,15 +21,18 @@ flowchart LR
     Developer[Developer / GitHub pull request] --> GitHub[GitHub repository]
     GitHub --> Webhook[GitHub webhook]
     Webhook --> Jenkins[Jenkins pipeline]
-    Jenkins --> Checkout[Checkout + metadata]
-    Checkout --> Validate[Validation + lint + tests]
-    Validate --> SAST[SAST / dependency / secret / IaC scanning]
-    SAST --> Docker[Docker image build]
-    Docker --> Trivy[Container + SBOM scanning]
-    Trivy --> ECR[Amazon ECR]
-    ECR --> Deploy[Development deployment]
-    Deploy --> ECS[ECS Fargate or optional EKS]
-    ECS --> Health[Health checks + audit]
+    Jenkins --> Ansible[Ansible preflight and orchestration]
+    Ansible --> Validate[Lint, typecheck, Prisma, tests]
+    Validate --> Security[Semgrep, npm audit, Trivy]
+    Security --> Docker[Build and scan digest-bound images]
+    Docker --> Approval[Explicit Jenkins deployment approval]
+    Approval --> Terraform[Terraform plans CloudFormation stacks]
+    Terraform --> CFN[CloudFormation owns AWS resources]
+    CFN --> ECR[Amazon ECR]
+    ECR --> ECS[ECS Fargate]
+    ECS --> Health[Ansible health and service verification]
+    ECS --> AMP[Amazon Managed Prometheus]
+    AMP --> AMG[Amazon Managed Grafana]
 
     Frontend[Next.js frontend] --> Backend[NestJS backend]
     Backend --> Postgres[PostgreSQL via Prisma]
@@ -66,7 +69,7 @@ Local UI flows:
 
 - Framework: NestJS REST API
 - Persistence: Prisma ORM + PostgreSQL
-- Auth: secure server-side session and OTP handling
+- Auth: demo backend flow only; it is not production-ready
 - Cache/queue: Redis is documented only when required; it is not used as a default dependency for demo mode
 - Runtime: Dockerized local development with optional production-like deployment targets
 
@@ -78,16 +81,13 @@ Backend directory:
 
 ## Prisma and database model
 
-The Prisma schema is created for the real production-oriented platform and includes models for:
+The current Prisma schema includes:
 
 - User
-- Role and permission-aware access
-- Session and OTP verification
-- Team profiles and skills
-- Projects and assignments
-- Milestones, tasks, activity, and notifications
-- File metadata, ratings, and audit logs
-- Integration configuration entries
+- Role enum (not yet enforced through complete authorization guards)
+- Session and OTP records
+- Projects and client/assignee relationships
+- Notifications
 
 Production guidance:
 
@@ -98,7 +98,7 @@ Production guidance:
 
 ## Authentication and authorization status
 
-The existing demo login is still intact. The production path is being implemented with a clear separation between:
+The existing demo login is still intact. The backend currently returns the generated OTP in its response and issues a demo-shaped session token; complete session verification, authorization guards, rate limits, and secure OTP delivery are not implemented. Do not expose the application as a production service until these issues are fixed and reviewed. The intended separation is:
 
 - local demo flows
 - backend session management
@@ -108,7 +108,7 @@ Rules:
 
 - Browser-supplied role values are never trusted.
 - Admin status must be created only via controlled backend logic.
-- OTPs are generated, validated, and stored in the backend path with expiry and single-use handling.
+- OTP records have expiry/single-use fields, but the current endpoint exposes the generated code and must be replaced with secure delivery.
 - SES and other external providers remain clearly marked as unconfigured until their credentials and authorization are available.
 
 ## Docker, Compose and local runtime
@@ -140,7 +140,7 @@ The Compose stack includes frontend, backend, and PostgreSQL. Production secrets
 
 ## Jenkins, GitHub webhook and CI/CD
 
-Jenkins pipeline configuration is scaffolded to match the requested production flow without assuming a live AWS environment or GitHub webhook is already configured.
+The Jenkinsfile runs the existing application checks and security gates. AWS deployment is disabled by default and is only eligible on `main` when the `DEPLOY_TO_AWS` parameter is explicitly enabled. Infrastructure changes require a separate Jenkins input approval after the Terraform plan has been archived.
 
 Files created:
 
@@ -148,29 +148,81 @@ Files created:
 
 Before running the pipeline, install the Jenkins NodeJS plugin and add a NodeJS installation named `NodeJS-22` under **Manage Jenkins → Tools**. The pipeline provisions that tool on the agent so `node` and `npm` are available in validation and build stages.
 
-The Prisma validation stage uses a non-production PostgreSQL placeholder URL only to validate the schema and generate the Prisma Client; it does not connect to a database. Runtime and deployment environments must provide the real `DATABASE_URL` through a secure secret mechanism.
+The Prisma validation and backend image build use a non-production PostgreSQL placeholder URL only to validate the schema and generate the Prisma Client; they do not connect to a database. That build-stage value is not copied into the final backend image. At runtime, ECS injects database fields from Secrets Manager and the backend constructs its connection URL; the isolated migration task does the same without logging the URL.
 
 Pipeline responsibilities:
 
 - checkout and branch metadata
+- verify Linux Jenkins-agent prerequisites, including Docker daemon access
 - install frontend and backend dependencies from their lockfiles
-- lint and validation
+- frontend/backend lint and TypeScript validation
 - Prisma Client generation and schema validation with a CI-only URL
-- tests
-- SAST and dependency scanning
-- secret scanning
-- Terraform/CloudFormation/Ansible checks
-- Docker builds and Trivy scans
-- AWS auth and ECR publishing
-- deployment approval and health verification
-- release notifications and audit metadata
+- frontend and backend test scripts
+- Semgrep SAST using the pinned `semgrep/semgrep:1.181.0` container
+- npm dependency audits
+- Trivy filesystem dependency, secret, and supported infrastructure-configuration scans
+- frontend and backend Docker builds, Trivy vulnerability scans, and CycloneDX SBOM generation
+- Jenkins artifact reports under `reports/trivy/`
+- optional AWS identity verification, ECR publication by immutable commit tag and digest, CloudFormation deployment through Terraform, an approved Prisma migration task, ECS health checks, and monitoring verification
+
+Trivy is downloaded from the official Aqua Security GitHub release, pinned to `0.76.0`, and verified against the release checksum before use. The Jenkins parameter `TRIVY_FAIL_ON_SEVERITY` defaults to `CRITICAL`; choose `HIGH,CRITICAL`, `MEDIUM,HIGH,CRITICAL`, or `LOW,MEDIUM,HIGH,CRITICAL` to apply a stricter gate. Readable reports for all four severities are archived even when a scan finds vulnerabilities. The secret report omits matched secret values; keep Jenkins artifact access restricted because scan findings can still disclose repository paths and vulnerability details.
+
+The Semgrep stage emits a JSON report; the dependency audit stage fails on high-severity npm findings while continuing later scans so reports can be collected. Trivy scans generate vulnerability/configuration JSON and readable summaries; the secret report omits matched values. Scan findings at or above the selected threshold fail the build. Keep Jenkins logs and artifacts access-controlled.
 
 Important constraints:
 
 - GitHub webhooks must be authenticated and validated.
 - Jenkins should not be exposed publicly without HTTPS and access control.
-- Pull requests and untrusted branches are not deployed to production automatically.
-- The pipeline should only claim success after the actual checks and deployments execute.
+- Pull requests and untrusted branches are never deployed to AWS.
+- Jenkins uses the existing EC2 instance profile rather than static AWS access keys. The EC2 role must receive reviewed, least-privilege permissions for S3 Terraform state, ECR, CloudFormation, ECS, RDS, Secrets Manager, CloudWatch, AMP, AMG, and `iam:PassRole` for only the ECS/monitoring roles created by these stacks.
+- The pipeline does not create the Terraform state bucket automatically. Bootstrap it once as documented below, configure `TF_STATE_BUCKET`, and review/migrate any existing Terraform state before enabling deployment.
+- Existing ECR repositories and the former Terraform-managed VPC are not auto-imported. The Terraform `removed` blocks prevent destruction only when the previous Terraform state is recovered and initialized. Existing CloudFormation stacks/resources must be imported or migrated before applying; a clean Terraform plan alone does not resolve resource ownership conflicts.
+- No AWS resources have been created or changed by the repository work. A successful local CI run is not evidence of an AWS deployment.
+
+## Local Prometheus and Grafana
+
+The opt-in Compose overlay is for local development only; it does not deploy AWS infrastructure. The CloudFormation application stack defines ECS Fargate services, Container Insights, an internal AMP remote-write collector, and private RDS. A separate monitoring stack defines Amazon Managed Prometheus and Amazon Managed Grafana. Prometheus/Grafana/exporter ports are not opened on the public load balancer.
+
+The backend exports authenticated Prometheus metrics at `/metrics` only when `METRICS_TOKEN_FILE` is configured. It records low-cardinality HTTP method/route/status counts and latency histograms, plus Node process CPU and memory metrics. The Prometheus-owned Node client is pinned at `@prometheus-io/client` 0.16.1 and requires Node 22+, so the backend image uses Node 22. The frontend and backend expose basic health endpoints used by HTTP probes. cAdvisor provides local container CPU/memory metrics; its host filesystem mounts are read-only, and neither cAdvisor nor the blackbox exporter has a host-published port.
+
+Before starting monitoring, create two secret files outside the repository. On PowerShell:
+
+```powershell
+$secretDirectory = Join-Path $HOME ".config\it-your-it-house"
+New-Item -ItemType Directory -Force $secretDirectory | Out-Null
+$metricsTokenFile = Join-Path $secretDirectory "metrics-token"
+$grafanaPasswordFile = Join-Path $secretDirectory "grafana-admin-password"
+$rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+$randomBytes = New-Object byte[] 32
+$rng.GetBytes($randomBytes)
+[IO.File]::WriteAllText($metricsTokenFile, [Convert]::ToBase64String($randomBytes))
+$securePassword = Read-Host "Choose a Grafana admin password" -AsSecureString
+$passwordPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePassword)
+try {
+  [IO.File]::WriteAllText($grafanaPasswordFile, [Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointer))
+} finally {
+  [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordPointer)
+}
+$env:METRICS_TOKEN_FILE = $metricsTokenFile
+$env:GRAFANA_ADMIN_PASSWORD_FILE = $grafanaPasswordFile
+$env:GRAFANA_ADMIN_USER = "admin"
+```
+
+Then start the local app and monitoring stack:
+
+```powershell
+docker compose -f compose.yaml -f compose.monitoring.yaml up --build -d
+```
+
+Prometheus and Grafana are bound to loopback only at `http://localhost:9090` and `http://localhost:3001`; exporter ports are only available on the internal Compose network. Grafana's admin password is read from the external secret file. Prometheus and Grafana data persist in Compose volumes. Open the provisioned dashboard at `http://localhost:3001/d/it-your-it-house-health/it-your-it-house-application-health`.
+
+Verify Grafana and Prometheus health, including active scrape targets, from Git Bash/WSL:
+
+```sh
+sh monitoring/verify.sh
+```
+
+This stack requires a Linux Docker engine for cAdvisor host metrics. Docker Desktop may expose its Linux VM's container metrics rather than Windows host resources. Do not expose the loopback ports or exporter services publicly. In AWS, Grafana uses an IAM role for CloudWatch and AMP queries and the provisioned dashboard is pushed with a Jenkins Secret Text credential named `grafana-api-token`. An AWS IAM Identity Center administrator must assign approved Grafana workspace users; the stack does not grant access to individual humans.
 
 ## Infrastructure as code and automation
 
@@ -182,21 +234,51 @@ Folders:
 - [cloudformation](C:/Users/USER/OneDrive/Desktop/it-your-it-house/cloudformation)
 - [ansible](C:/Users/USER/OneDrive/Desktop/it-your-it-house/ansible)
 
-Terraform is defined as the primary IaC path. CloudFormation is reserved for explicitly justified isolated stacks. Ansible is used for host configuration tasks rather than infrastructure lifecycle management.
+Ownership is deliberately separated:
+
+- Terraform manages only the three CloudFormation stacks (remote-state bootstrap, ECR registry, and application/monitoring).
+- CloudFormation is the sole owner of AWS resources, including VPC/networking, ECR, ECS/Fargate, RDS, IAM, AMP, and AMG.
+- Ansible performs Jenkins-agent preflight, invokes Terraform, runs a separately approved Prisma migration task, and verifies ECS/ALB/AMP/AMG health. It does not create duplicate AWS resources.
+
+The remote Terraform backend is an S3 bucket bootstrapped once from `cloudformation/terraform-state-stack.yaml`. The bucket has versioning, encryption, public-access blocking, TLS-only access, and S3 lock files. Bootstrap is an AWS change and is not run automatically by this repo work. An authorized operator must execute this from the approved Jenkins/EC2 environment after reviewing the template:
+
+```sh
+aws cloudformation deploy \
+  --stack-name it-your-it-house-terraform-state \
+  --template-file cloudformation/terraform-state-stack.yaml \
+  --parameter-overrides ProjectName=it-your-it-house \
+  --region us-east-1
+
+aws cloudformation describe-stacks \
+  --stack-name it-your-it-house-terraform-state \
+  --query 'Stacks[0].Outputs[?OutputKey==`TerraformStateBucketName`].OutputValue | [0]' \
+  --output text \
+  --region us-east-1
+```
+
+Configure the returned bucket name as the Jenkins environment variable `TF_STATE_BUCKET`, and ensure the EC2 instance profile can read/write/delete the state object and `.tflock` object. Terraform >=1.10 is required for S3 lock-file support.
+
+**Do not enable `DEPLOY_TO_AWS` until the prior Terraform state and AWS ownership are reconciled.** The historical config managed ECR repositories and a VPC directly. The current Terraform has non-destroying `removed` blocks to protect those prior addresses only if the old state is recovered and migrated. If a repository, VPC, or stack already exists without a matching CloudFormation stack in the active remote state, Terraform cannot safely adopt it automatically. Import or migrate the existing resources/state in a separately reviewed change first. Do not apply a plan that proposes replacement or deletion. `destroy = false` intentionally leaves old resources alive and unmanaged; an old VPC may include a billable NAT gateway, so inventory and migrate/retire it through an approved change before creating a duplicate network.
+
+Application and monitoring stacks are created only on the `main` branch when `DEPLOY_TO_AWS=true`; Jenkins pauses for plan approval. The first application release creates a generated-password PostgreSQL database and runs the checked-in additive Prisma migration as a separate ECS task. Do not use this initial migration against an existing database without first checking/baselining its schema and making a tested backup.
+
+These stacks create billable AWS resources (including NAT gateway/EIP, ALB, RDS, Fargate, CloudWatch Container Insights, AMP, and AMG). Review a current account/region-specific estimate and the Terraform plan before each approval. No cost estimate or live AWS resource validation has been performed for this change.
+
+Jenkins setup:
+
+- EC2/Linux agent prerequisites: NodeJS 22 via the Jenkins NodeJS plugin (tool name `NodeJS-22`), Docker Engine with access granted only to the trusted Jenkins agent, Terraform >=1.10, AWS CLI v2, Ansible, `jq`, `curl`, `sha256sum`, and `tar`. Docker-group membership is effectively root access; use only on a dedicated trusted agent, never loosen socket permissions.
+- Use the EC2 instance profile, not static AWS access keys. Configure `AWS_REGION`, `TF_STATE_BUCKET`, `TF_VAR_monitoring_instance_role_name` (the actual Jenkins instance-profile role name), a valid `TF_VAR_certificate_arn` for HTTPS, and a trusted non-public `TF_VAR_allowed_web_ingress_cidr`. Restrict IAM actions and `iam:PassRole` to only the resources/roles needed by these templates.
+- Jenkins must have the Credentials plugin and a Secret Text credential ID `grafana-api-token`. After the AMG workspace is created, an AWS IAM Identity Center administrator must assign approved workspace users, create a Grafana service-account token, and store it in that credential. The pipeline binds it only for dashboard/data-source provisioning; Ansible suppresses token-bearing task output.
+- `ansible/playbooks/jenkins-setup.yml` is host-mutating and intentionally fails unless explicitly run with `-e allow_host_package_changes=true`; it does not configure Docker socket permissions or the AWS instance profile.
+- Jenkins must be accessible only through approved authenticated HTTPS access. Artifact access must be restricted because SBOMs and scan reports reveal dependency details and repository paths.
+- **Do not expose the current application broadly as production.** The demo OTP endpoint returns the generated code and session tokens are demo-shaped; server-side authentication/authorization is not production-ready. The application plan is blocked unless Jenkins explicitly supplies a narrowly allowlisted `TF_VAR_allowed_web_ingress_cidr` instead of `0.0.0.0/0` (for controlled staging access); this network restriction is not a substitute for fixing auth/RBAC before any public launch.
+- Each deployment conservatively sets ECS desired count to zero before the separately approved one-off Prisma migration, then requires a second reviewed Terraform plan to enable traffic. This causes deployment downtime; a migration failure leaves services stopped rather than serving against an unverified schema.
 
 ## Security, scanning and release gates
 
-The production workflow requires security gates for:
+Semgrep, npm audit, Trivy filesystem/secret/configuration/image scans, CycloneDX SBOMs, frontend/backend lint/type checking, Prisma validation, tests, and build checks are wired into Jenkins. The Trivy severity gate defaults to CRITICAL and is adjustable via the pipeline parameter. Terraform plans require manual approval; AWS publishing/deployment is gated by `DEPLOY_TO_AWS` and `main`.
 
-- SAST
-- dependency scanning
-- secret scanning
-- container scanning
-- Terraform and CloudFormation validation
-- Ansible lint and syntax checks
-- health checks and release verification
-
-These are documented and implemented as pipeline stages in the Jenkinsfile. Findings must be reviewed, documented, and approved only with explicit ownership and expiry conditions.
+CloudFormation templates, remote state, and the Jenkins host have not been validated or deployed against the target AWS account. Add dedicated `cfn-lint`, `ansible-lint`, and Terraform security scanning (for example Checkov) only after pinning versions, reviewing their policy behavior, and adding CI reports. Do not describe the Jenkins host setup playbook as a real scan.
 
 ## SES, WhatsApp and external integrations
 
@@ -222,10 +304,21 @@ The current repo includes frontend tests and validation behavior:
 ```powershell
 node --experimental-strip-types --test tests/*.test.mjs
 npm run lint
+npx tsc --noEmit
+npm ci
+npm run test
+npm run build
+cd backend
+npm ci --legacy-peer-deps
+npx prisma generate
+npx prisma validate
+npm run lint
+npx tsc --noEmit
+npm test
 npm run build
 ```
 
-These checks must continue to pass while the backend and infrastructure scaffolding are expanded. The platform must not claim AWS, WhatsApp, SES, or Jenkins success without evidence from the actual configured environment.
+These commands are intended for a trusted Linux Jenkins agent with dependencies configured; Docker/AWS/template validation has not been run from this Windows workspace. The backend test script currently reports that no backend tests are configured. The platform must not claim AWS, WhatsApp, SES, or Jenkins deployment success without evidence from the actual configured environment.
 
 ## Implementation checklist
 

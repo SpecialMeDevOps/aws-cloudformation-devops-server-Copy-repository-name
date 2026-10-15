@@ -1,0 +1,122 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Amazon Managed Prometheus and Grafana plus optional scoped metrics access for the existing Jenkins EC2 role.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: it-your-it-house
+  Environment:
+    Type: String
+    Default: dev
+  MonitoringRoleName:
+    Type: String
+    Default: ""
+    Description: Existing Jenkins EC2 instance-profile role name. No role is created or replaced by this stack.
+
+Conditions:
+  HasMonitoringRole: !Not [!Equals [!Ref MonitoringRoleName, ""]]
+
+Resources:
+  AmpWorkspace:
+    Type: AWS::APS::Workspace
+    Properties:
+      Alias: !Sub "${ProjectName}-${Environment}"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  GrafanaServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: grafana.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: QueryManagedMonitoring
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - aps:QueryMetrics
+                  - aps:GetLabels
+                  - aps:GetMetricMetadata
+                  - aps:GetSeries
+                Resource: !GetAtt AmpWorkspace.Arn
+              - Effect: Allow
+                Action:
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:FilterLogEvents
+                Resource: "*"
+
+  GrafanaWorkspace:
+    Type: AWS::Grafana::Workspace
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}"
+      Description: !Sub "Observability workspace for ${ProjectName} ${Environment}."
+      AccountAccessType: CURRENT_ACCOUNT
+      AuthenticationProviders:
+        - AWS_SSO
+      PermissionType: CUSTOMER_MANAGED
+      RoleArn: !GetAtt GrafanaServiceRole.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ExistingJenkinsRoleMetricsPolicy:
+    Type: AWS::IAM::Policy
+    Condition: HasMonitoringRole
+    Properties:
+      PolicyName: !Sub "${ProjectName}-${Environment}-monitoring-readonly"
+      Roles:
+        - !Ref MonitoringRoleName
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - cloudwatch:DescribeAlarms
+              - cloudwatch:GetMetricData
+              - cloudwatch:GetMetricStatistics
+              - cloudwatch:ListMetrics
+              - ecs:DescribeClusters
+              - ecs:DescribeServices
+              - ecs:DescribeTasks
+              - ecs:ListClusters
+              - ecs:ListServices
+              - ecs:ListTasks
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - aps:QueryMetrics
+              - aps:GetLabels
+              - aps:GetMetricMetadata
+              - aps:GetSeries
+            Resource: !GetAtt AmpWorkspace.Arn
+
+Outputs:
+  WorkspaceId:
+    Value: !Ref AmpWorkspace
+  WorkspaceArn:
+    Value: !GetAtt AmpWorkspace.Arn
+  RemoteWriteEndpoint:
+    Value: !Sub "https://aps-workspaces.${AWS::Region}.amazonaws.com/workspaces/${AmpWorkspace}/api/v1/remote_write"
+  PrometheusQueryEndpoint:
+    Value: !GetAtt AmpWorkspace.PrometheusEndpoint
+  GrafanaWorkspaceId:
+    Value: !GetAtt GrafanaWorkspace.Id
+  GrafanaWorkspaceEndpoint:
+    Value: !GetAtt GrafanaWorkspace.Endpoint

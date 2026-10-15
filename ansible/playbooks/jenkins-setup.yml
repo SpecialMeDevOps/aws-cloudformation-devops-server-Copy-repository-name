@@ -3,6 +3,14 @@
   hosts: jenkins
   become: true
   tasks:
+    - name: Require explicit approval for Jenkins host changes
+      ansible.builtin.assert:
+        that:
+          - allow_host_package_changes | default(false) | bool
+        fail_msg: >-
+          This playbook changes the Jenkins host. Re-run only after an authorized
+          operator supplies -e allow_host_package_changes=true.
+
     - name: Ensure required OS packages are installed
       ansible.builtin.apt:
         name:

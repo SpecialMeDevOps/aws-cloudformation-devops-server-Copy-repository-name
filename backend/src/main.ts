@@ -2,10 +2,12 @@ import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module.js';
+import { HttpMetricsInterceptor } from './monitoring/http-metrics.interceptor.js';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
   const port = Number(process.env.APP_PORT ?? 4000);
+  app.useGlobalInterceptors(app.get(HttpMetricsInterceptor));
 
   app.enableCors({
     origin: true,

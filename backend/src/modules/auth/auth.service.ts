@@ -6,6 +6,15 @@ import { PrismaService } from '../../common/prisma.service.js';
 export class AuthService {
   constructor(private readonly prisma: PrismaService) {}
 
+  async health() {
+    await this.prisma.$queryRaw`SELECT 1`;
+    return {
+      ok: true,
+      service: 'auth',
+      database: 'ready',
+    };
+  }
+
   async requestOtp(email: string) {
     const normalizedEmail = email.trim().toLowerCase();
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {

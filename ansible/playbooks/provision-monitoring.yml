@@ -1,0 +1,200 @@
+---
+- name: Provision Amazon Managed Prometheus in Grafana and publish the dashboard
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    terraform_directory: "{{ playbook_dir }}/../../terraform"
+    grafana_token: "{{ lookup('env', 'GRAFANA_API_TOKEN') }}"
+  tasks:
+    - name: Require protected Grafana API token and AWS region
+      ansible.builtin.assert:
+        that:
+          - grafana_token | length > 0
+          - lookup('env', 'AWS_REGION') | length > 0
+        fail_msg: "Provisioning requires the protected GRAFANA_API_TOKEN Jenkins credential and AWS_REGION."
+      no_log: true
+
+    - name: Read deployment outputs
+      ansible.builtin.command:
+        argv:
+          - terraform
+          - output
+          - -json
+        chdir: "{{ terraform_directory }}"
+      register: outputs_raw
+      changed_when: false
+      no_log: true
+
+    - name: Parse deployment outputs
+      ansible.builtin.set_fact:
+        infrastructure_outputs: "{{ outputs_raw.stdout | from_json }}"
+      no_log: true
+
+    - name: Check Grafana API availability
+      ansible.builtin.uri:
+        url: "https://{{ infrastructure_outputs.monitoring_outputs.value.GrafanaWorkspaceEndpoint }}/api/health"
+        method: GET
+        status_code: 200
+        return_content: false
+        timeout: 15
+      register: grafana_health
+      retries: 12
+      delay: 10
+      until: grafana_health.status == 200
+      changed_when: false
+
+    - name: List existing Grafana data sources
+      ansible.builtin.uri:
+        url: "https://{{ infrastructure_outputs.monitoring_outputs.value.GrafanaWorkspaceEndpoint }}/api/datasources"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ grafana_token }}"
+        status_code: 200
+        return_content: true
+        timeout: 15
+      register: grafana_datasources
+      changed_when: false
+      no_log: true
+
+    - name: Configure managed Prometheus and CloudWatch data sources
+      ansible.builtin.uri:
+        url: >-
+          https://{{ infrastructure_outputs.monitoring_outputs.value.GrafanaWorkspaceEndpoint
+          }}/api/datasources/uid/{{ item.uid }}
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ grafana_token }}"
+          Content-Type: application/json
+        body: "{{ item }}"
+        body_format: json
+        status_code: [200, 201]
+        return_content: false
+        timeout: 15
+      loop:
+        - name: Amazon Managed Prometheus
+          uid: prometheus
+          type: prometheus
+          access: proxy
+          url: "{{ infrastructure_outputs.monitoring_outputs.value.PrometheusQueryEndpoint }}"
+          isDefault: true
+          jsonData:
+            sigV4Auth: true
+            sigV4AuthType: default
+            sigV4Region: "{{ lookup('env', 'AWS_REGION') }}"
+        - name: Amazon CloudWatch
+          uid: cloudwatch
+          type: cloudwatch
+          access: proxy
+          jsonData:
+            authType: default
+            defaultRegion: "{{ lookup('env', 'AWS_REGION') }}"
+      loop_control:
+        label: "{{ item.name }}"
+      no_log: true
+      when: item.uid in (grafana_datasources.json | map(attribute='uid') | list)
+
+    - name: Create missing managed Grafana data sources
+      ansible.builtin.uri:
+        url: "https://{{ infrastructure_outputs.monitoring_outputs.value.GrafanaWorkspaceEndpoint }}/api/datasources"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ grafana_token }}"
+          Content-Type: application/json
+        body: "{{ item }}"
+        body_format: json
+        status_code: [200, 201]
+        return_content: false
+        timeout: 15
+      loop:
+        - name: Amazon Managed Prometheus
+          uid: prometheus
+          type: prometheus
+          access: proxy
+          url: "{{ infrastructure_outputs.monitoring_outputs.value.PrometheusQueryEndpoint }}"
+          isDefault: true
+          jsonData:
+            sigV4Auth: true
+            sigV4AuthType: default
+            sigV4Region: "{{ lookup('env', 'AWS_REGION') }}"
+        - name: Amazon CloudWatch
+          uid: cloudwatch
+          type: cloudwatch
+          access: proxy
+          jsonData:
+            authType: default
+            defaultRegion: "{{ lookup('env', 'AWS_REGION') }}"
+      loop_control:
+        label: "{{ item.name }}"
+      no_log: true
+      when: item.uid not in (grafana_datasources.json | map(attribute='uid') | list)
+
+    - name: Publish the application health dashboard
+      ansible.builtin.uri:
+        url: "https://{{ infrastructure_outputs.monitoring_outputs.value.GrafanaWorkspaceEndpoint }}/api/dashboards/db"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ grafana_token }}"
+          Content-Type: application/json
+        body:
+          dashboard: "{{ lookup('file', playbook_dir + '/../../monitoring/grafana/provisioning/dashboards/it-your-it-house.json') | from_json }}"
+          folderId: 0
+          overwrite: true
+        body_format: json
+        status_code: 200
+        return_content: false
+        timeout: 15
+      no_log: true
+
+    - name: Confirm provisioned dashboard exists
+      ansible.builtin.uri:
+        url: >-
+          https://{{ infrastructure_outputs.monitoring_outputs.value.GrafanaWorkspaceEndpoint
+          }}/api/dashboards/uid/it-your-it-house-health
+        method: GET
+        headers:
+          Authorization: "Bearer {{ grafana_token }}"
+        status_code: 200
+        return_content: false
+        timeout: 15
+      changed_when: false
+      no_log: true
+
+    - name: Query backend scrape health from Amazon Managed Prometheus
+      ansible.builtin.command:
+        argv:
+          - aws
+          - amp
+          - query-metrics
+          - --workspace-id
+          - "{{ infrastructure_outputs.monitoring_outputs.value.WorkspaceId }}"
+          - --query-string
+          - 'up{job="it-your-it-house-backend"}'
+          - --region
+          - "{{ lookup('env', 'AWS_REGION') }}"
+          - --output
+          - json
+      register: amp_query
+      changed_when: false
+      retries: 12
+      delay: 10
+      until: amp_query.rc == 0
+      no_log: true
+
+    - name: Parse the metrics query result
+      ansible.builtin.set_fact:
+        amp_query_data: >-
+          {{
+            (amp_query.stdout | from_json).data
+            if (amp_query.stdout | from_json).data is mapping
+            else (amp_query.stdout | from_json).data | from_json
+          }}
+      no_log: true
+
+    - name: Require a healthy backend Prometheus scrape
+      ansible.builtin.assert:
+        that:
+          - amp_query_data.result | length > 0
+          - amp_query_data.result[0].value[1] == "1"
+        fail_msg: "Amazon Managed Prometheus has no healthy backend scrape result."
+      no_log: true

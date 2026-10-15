@@ -21,6 +21,13 @@
 # production
 /build
 /backend/dist
+/reports/trivy/
+/reports/terraform-plan.txt
+/secrets/
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
 
 # misc
 .DS_Store

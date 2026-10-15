@@ -5,7 +5,6 @@ import {
   HttpCode,
   HttpStatus,
   Post,
-  Query,
 } from '@nestjs/common';
 import { ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { AuthService } from './auth.service.js';
@@ -43,11 +42,7 @@ export class AuthController {
   @Get('health')
   @ApiOperation({ summary: 'Health check for the auth service' })
   @ApiResponse({ status: 200, description: 'Service is healthy' })
-  async health(@Query('email') email?: string) {
-    return {
-      ok: true,
-      email: email ?? null,
-      service: 'auth',
-    };
+  async health() {
+    return this.authService.health();
   }
 }

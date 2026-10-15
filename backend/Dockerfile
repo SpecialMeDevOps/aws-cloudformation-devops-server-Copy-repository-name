@@ -1,11 +1,12 @@
-FROM node:20-alpine AS deps
+FROM node:22-alpine AS deps
 WORKDIR /app/backend
+ENV DATABASE_URL=postgresql://ci_user:ci_password@localhost:5432/ci_validation?schema=public
 COPY package*.json ./
-RUN npm install --legacy-peer-deps
+RUN npm ci --legacy-peer-deps
 COPY . .
-RUN npm run build
+RUN npx prisma generate && npm run build
 
-FROM node:20-alpine AS runner
+FROM node:22-alpine AS runner
 WORKDIR /app/backend
 ENV NODE_ENV=production
 ENV APP_PORT=4000

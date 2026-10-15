@@ -1,0 +1,76 @@
+---
+- name: Check CI host prerequisites
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    required_commands:
+      - aws
+      - docker
+      - jq
+      - terraform
+  tasks:
+    - name: Check required executable availability
+      ansible.builtin.command:
+        argv:
+          - sh
+          - -c
+          - "command -v {{ item }}"
+      loop: "{{ required_commands }}"
+      register: command_checks
+      changed_when: false
+      failed_when: false
+
+    - name: Stop when a required executable is unavailable
+      ansible.builtin.assert:
+        that:
+          - item.rc == 0
+        fail_msg: "Required Jenkins agent executable is missing: {{ item.item }}"
+      loop: "{{ command_checks.results }}"
+
+    - name: Verify AWS identity for deployment builds
+      ansible.builtin.command:
+        argv:
+          - aws
+          - sts
+          - get-caller-identity
+          - --query
+          - Account
+          - --output
+          - text
+      register: aws_account
+      changed_when: false
+      when: verify_aws_identity | default(false) | bool
+
+    - name: Reject an unconfigured AWS identity
+      ansible.builtin.assert:
+        that:
+          - aws_account.stdout is match("^[0-9]{12}$")
+        fail_msg: >-
+          AWS identity could not be verified. Configure the EC2 instance profile
+          or Jenkins AWS credential binding before enabling deployment stages.
+      when: verify_aws_identity | default(false) | bool
+
+    - name: Verify Jenkins can access the Docker daemon
+      ansible.builtin.command:
+        argv:
+          - docker
+          - info
+          - --format
+          - "{{ '{{' }}.ServerVersion{{ '}}' }}"
+      register: docker_daemon
+      changed_when: false
+
+    - name: Verify the configured Terraform version satisfies the project constraint
+      ansible.builtin.command:
+        argv:
+          - terraform
+          - version
+      register: terraform_version
+      changed_when: false
+
+    - name: Require Terraform 1.10 or newer
+      ansible.builtin.assert:
+        that:
+          - terraform_version.stdout is search("Terraform v(1\\.(1[0-9]|[2-9][0-9])|[2-9]\\.)")
+        fail_msg: "Terraform 1.10 or newer is required for safe S3 backend lock files."

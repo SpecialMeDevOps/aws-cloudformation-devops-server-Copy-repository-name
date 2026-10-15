@@ -1,0 +1,115 @@
+---
+- name: Run additive Prisma migrations on an isolated ECS task
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    terraform_directory: "{{ playbook_dir }}/../../terraform"
+  tasks:
+    - name: Require explicit migration approval
+      ansible.builtin.assert:
+        that:
+          - approved_database_migration | default(false) | bool
+        fail_msg: "Database migrations require explicit approval after reviewing the migration SQL."
+
+    - name: Read application stack outputs
+      ansible.builtin.command:
+        argv:
+          - terraform
+          - output
+          - -json
+        chdir: "{{ terraform_directory }}"
+      register: outputs_raw
+      changed_when: false
+      no_log: true
+
+    - name: Parse application outputs
+      ansible.builtin.set_fact:
+        app_outputs: "{{ (outputs_raw.stdout | from_json).application_outputs.value }}"
+      no_log: true
+
+    - name: Build private task network configuration
+      ansible.builtin.set_fact:
+        migration_network_configuration:
+          awsvpcConfiguration:
+            subnets:
+              - "{{ app_outputs.PrivateSubnetAId }}"
+              - "{{ app_outputs.PrivateSubnetBId }}"
+            securityGroups:
+              - "{{ app_outputs.BackendSecurityGroupId }}"
+            assignPublicIp: DISABLED
+      no_log: true
+
+    - name: Start the Prisma migration task
+      ansible.builtin.command:
+        argv:
+          - aws
+          - ecs
+          - run-task
+          - --cluster
+          - "{{ app_outputs.ClusterName }}"
+          - --launch-type
+          - FARGATE
+          - --task-definition
+          - "{{ app_outputs.BackendTaskDefinitionArn }}"
+          - --network-configuration
+          - "{{ migration_network_configuration | to_json }}"
+          - --overrides
+          - >-
+            {"containerOverrides":[{"name":"backend","command":["npm","run","prisma:migrate:deploy"]}]}
+          - --region
+          - "{{ lookup('env', 'AWS_REGION') }}"
+          - --output
+          - json
+      register: migration_launch
+      changed_when: true
+      no_log: true
+
+    - name: Parse migration task ARN
+      ansible.builtin.set_fact:
+        migration_task_arn: "{{ (migration_launch.stdout | from_json).tasks[0].taskArn }}"
+      no_log: true
+
+    - name: Wait for the migration task to stop
+      ansible.builtin.command:
+        argv:
+          - aws
+          - ecs
+          - wait
+          - tasks-stopped
+          - --cluster
+          - "{{ app_outputs.ClusterName }}"
+          - --tasks
+          - "{{ migration_task_arn }}"
+          - --region
+          - "{{ lookup('env', 'AWS_REGION') }}"
+      changed_when: false
+      async: 1800
+      poll: 15
+      no_log: true
+
+    - name: Read migration task result
+      ansible.builtin.command:
+        argv:
+          - aws
+          - ecs
+          - describe-tasks
+          - --cluster
+          - "{{ app_outputs.ClusterName }}"
+          - --tasks
+          - "{{ migration_task_arn }}"
+          - --region
+          - "{{ lookup('env', 'AWS_REGION') }}"
+          - --output
+          - json
+      register: migration_result
+      changed_when: false
+      no_log: true
+
+    - name: Require a successful Prisma migration exit code
+      ansible.builtin.assert:
+        that:
+          - (migration_result.stdout | from_json).tasks | length == 1
+          - (migration_result.stdout | from_json).tasks[0].containers | selectattr('name', 'equalto', 'backend') | map(attribute='exitCode') | select('equalto', 0) | list | length == 1
+        fail_msg: "Prisma migration task failed. Inspect the restricted ECS task logs and stop deployment."
+      no_log: true

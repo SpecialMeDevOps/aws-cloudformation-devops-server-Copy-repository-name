@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { AuthModule } from './modules/auth/auth.module.js';
+import { MonitoringModule } from './monitoring/monitoring.module.js';
 import { ProjectsModule } from './modules/projects/projects.module.js';
 
 @Module({
@@ -10,6 +11,7 @@ import { ProjectsModule } from './modules/projects/projects.module.js';
       envFilePath: ['.env', '.env.local'],
     }),
     AuthModule,
+    MonitoringModule,
     ProjectsModule,
   ],
 })

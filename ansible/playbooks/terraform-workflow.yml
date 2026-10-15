@@ -1,0 +1,238 @@
+---
+- name: Run a reviewed Terraform CloudFormation-stack workflow
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    terraform_directory: "{{ playbook_dir }}/../../terraform"
+    state_bucket: "{{ lookup('env', 'TF_STATE_BUCKET') }}"
+    aws_region: "{{ lookup('env', 'AWS_REGION') }}"
+    environment_name: "{{ lookup('env', 'TF_VAR_environment') | default('dev', true) }}"
+    project_name: "{{ lookup('env', 'TF_VAR_project_name') | default('it-your-it-house', true) }}"
+  tasks:
+    - name: Validate workflow mode and remote-state settings
+      ansible.builtin.assert:
+        that:
+          - terraform_operation in ['plan', 'apply']
+          - state_bucket | length > 0
+          - aws_region | length > 0
+        fail_msg: "Terraform requires a plan/apply mode and configured remote-state bucket and AWS region."
+
+    - name: Require deployment settings for an application stack
+      ansible.builtin.assert:
+        that:
+          - lookup('env', 'TF_VAR_monitoring_instance_role_name') | length > 0
+          - lookup('env', 'TF_VAR_frontend_image_uri') is match(".+@sha256:[a-f0-9]{64}")
+          - lookup('env', 'TF_VAR_backend_image_uri') is match(".+@sha256:[a-f0-9]{64}")
+          - lookup('env', 'TF_VAR_certificate_arn') | length > 0
+          - lookup('env', 'TF_VAR_allowed_web_ingress_cidr') | length > 0
+          - lookup('env', 'TF_VAR_allowed_web_ingress_cidr') != '0.0.0.0/0'
+        fail_msg: >-
+          Application deployment requires the Jenkins EC2 role name for scoped
+          monitoring access, both scanned ECR image digests, and a trusted,
+          explicitly configured allowlisted ALB ingress CIDR rather than 0.0.0.0/0,
+          and a valid ACM certificate for HTTPS.
+      when:
+        - terraform_operation == 'plan'
+        - lookup('env', 'TF_VAR_deploy_application') | bool
+
+    - name: Require explicit approval before applying infrastructure
+      ansible.builtin.assert:
+        that:
+          - approved_cloudformation_change | default(false) | bool
+        fail_msg: "Terraform apply is blocked until the reviewed CloudFormation change is approved."
+      when: terraform_operation == 'apply'
+
+    - name: Initialize the S3 remote backend
+      ansible.builtin.command:
+        argv:
+          - terraform
+          - init
+          - -input=false
+          - -backend-config=bucket={{ state_bucket }}
+          - -backend-config=key={{ project_name }}/{{ environment_name }}/terraform.tfstate
+          - -backend-config=region={{ aws_region }}
+          - -backend-config=encrypt=true
+          - -backend-config=use_lockfile=true
+        chdir: "{{ terraform_directory }}"
+      changed_when: false
+      when: terraform_operation == 'plan'
+
+    - name: Read Terraform resource ownership state
+      ansible.builtin.command:
+        argv:
+          - terraform
+          - state
+          - list
+        chdir: "{{ terraform_directory }}"
+      register: terraform_state_addresses
+      changed_when: false
+      failed_when: >-
+        terraform_state_addresses.rc != 0 and
+        'No state file was found' not in terraform_state_addresses.stderr
+      when: terraform_operation == 'plan'
+
+    - name: Check whether the registry CloudFormation stack already exists
+      ansible.builtin.command:
+        argv:
+          - aws
+          - cloudformation
+          - describe-stacks
+          - --stack-name
+          - "{{ project_name }}-{{ environment_name }}-registry"
+          - --query
+          - "Stacks[0].StackId"
+          - --output
+          - text
+          - --region
+          - "{{ aws_region }}"
+      register: registry_stack
+      changed_when: false
+      failed_when: registry_stack.rc != 0 and 'does not exist' not in registry_stack.stderr
+      when: terraform_operation == 'plan'
+
+    - name: Check whether prior frontend ECR repository exists
+      ansible.builtin.command:
+        argv:
+          - aws
+          - ecr
+          - describe-repositories
+          - --repository-names
+          - "{{ project_name }}-frontend"
+          - --query
+          - "repositories[0].repositoryName"
+          - --output
+          - text
+          - --region
+          - "{{ aws_region }}"
+      register: frontend_repository
+      changed_when: false
+      failed_when: frontend_repository.rc != 0 and 'RepositoryNotFoundException' not in frontend_repository.stderr
+      when: terraform_operation == 'plan'
+
+    - name: Check whether prior backend ECR repository exists
+      ansible.builtin.command:
+        argv:
+          - aws
+          - ecr
+          - describe-repositories
+          - --repository-names
+          - "{{ project_name }}-backend"
+          - --query
+          - "repositories[0].repositoryName"
+          - --output
+          - text
+          - --region
+          - "{{ aws_region }}"
+      register: backend_repository
+      changed_when: false
+      failed_when: backend_repository.rc != 0 and 'RepositoryNotFoundException' not in backend_repository.stderr
+      when: terraform_operation == 'plan'
+
+    - name: Block unmanaged registry resource adoption or replacement
+      ansible.builtin.assert:
+        that:
+          - >-
+            registry_stack.rc != 0 or
+            'aws_cloudformation_stack.registry' in (terraform_state_addresses.stdout_lines | default([]))
+          - >-
+            registry_stack.rc == 0 or
+            'aws_cloudformation_stack.registry' not in (terraform_state_addresses.stdout_lines | default([]))
+          - >-
+            registry_stack.rc == 0 or
+            (frontend_repository.rc != 0 and backend_repository.rc != 0)
+        fail_msg: >-
+          Existing registry resources are not represented by the current Terraform
+          CloudFormation-stack state. Import/migrate and review the old state and
+          ECR repositories before planning or applying; this workflow will not adopt
+          or replace them automatically.
+      when: terraform_operation == 'plan'
+
+    - name: Check existing application and monitoring stack ownership
+      ansible.builtin.command:
+        argv:
+          - aws
+          - cloudformation
+          - describe-stacks
+          - --stack-name
+          - "{{ item.name }}"
+          - --query
+          - "Stacks[0].StackId"
+          - --output
+          - text
+          - --region
+          - "{{ aws_region }}"
+      loop:
+        - name: "{{ project_name }}-{{ environment_name }}-application"
+          address: aws_cloudformation_stack.application[0]
+        - name: "{{ project_name }}-{{ environment_name }}-monitoring"
+          address: aws_cloudformation_stack.monitoring[0]
+      loop_control:
+        label: "{{ item.name }}"
+      register: application_stack_checks
+      changed_when: false
+      failed_when: application_stack_checks.rc != 0 and 'does not exist' not in application_stack_checks.stderr
+      when:
+        - terraform_operation == 'plan'
+        - lookup('env', 'TF_VAR_deploy_application') | bool
+
+    - name: Block unmanaged application or monitoring stack adoption
+      ansible.builtin.assert:
+        that:
+          - >-
+            item.rc != 0 or
+            item.item.address in (terraform_state_addresses.stdout_lines | default([]))
+          - >-
+            item.rc == 0 or
+            item.item.address not in (terraform_state_addresses.stdout_lines | default([]))
+        fail_msg: >-
+          An application or monitoring stack exists outside the active Terraform
+          state, or is recorded in state after deletion. Review/import the existing
+          stack before proceeding; automatic adoption is disabled.
+      loop: "{{ application_stack_checks.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when:
+        - terraform_operation == 'plan'
+        - lookup('env', 'TF_VAR_deploy_application') | bool
+
+    - name: Create the reviewed infrastructure plan
+      ansible.builtin.command:
+        argv:
+          - terraform
+          - plan
+          - -input=false
+          - -lock-timeout=5m
+          - -out=tfplan
+        chdir: "{{ terraform_directory }}"
+      when: terraform_operation == 'plan'
+
+    - name: Render the plan for Jenkins approval
+      ansible.builtin.shell:
+        cmd: mkdir -p ../reports && terraform show -no-color tfplan > ../reports/terraform-plan.txt
+        chdir: "{{ terraform_directory }}"
+      changed_when: true
+      when: terraform_operation == 'plan'
+
+    - name: Apply only the saved and approved infrastructure plan
+      ansible.builtin.command:
+        argv:
+          - terraform
+          - apply
+          - -input=false
+          - -lock-timeout=5m
+          - tfplan
+        chdir: "{{ terraform_directory }}"
+      when: terraform_operation == 'apply'
+
+    - name: Read non-sensitive Terraform outputs
+      ansible.builtin.command:
+        argv:
+          - terraform
+          - output
+          - -json
+        chdir: "{{ terraform_directory }}"
+      register: terraform_outputs
+      changed_when: false
+      when: terraform_operation == 'apply'
+      no_log: true
