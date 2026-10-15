@@ -46,14 +46,14 @@ resource "aws_cloudformation_stack" "application" {
   depends_on    = [aws_cloudformation_stack.monitoring]
 
   parameters = {
-    ProjectName           = var.project_name
-    Environment           = var.environment
-    FrontendImageUri      = var.frontend_image_uri
-    BackendImageUri       = var.backend_image_uri
-    CertificateArn        = var.certificate_arn
-    AllowedWebIngressCidr = var.allowed_web_ingress_cidr
-    DbInstanceClass       = var.db_instance_class
-    ServiceDesiredCount   = var.service_desired_count
+    ProjectName            = var.project_name
+    Environment            = var.environment
+    FrontendImageUri       = var.frontend_image_uri
+    BackendImageUri        = var.backend_image_uri
+    CertificateArn         = var.certificate_arn
+    AllowedWebIngressCidr  = var.allowed_web_ingress_cidr
+    DbInstanceClass        = var.db_instance_class
+    ServiceDesiredCount    = var.service_desired_count
     AmpRemoteWriteEndpoint = aws_cloudformation_stack.monitoring[0].outputs["RemoteWriteEndpoint"]
     AmpWorkspaceArn        = aws_cloudformation_stack.monitoring[0].outputs["WorkspaceArn"]
   }
@@ -72,9 +72,9 @@ resource "aws_cloudformation_stack" "monitoring" {
   template_body = file("${path.module}/../cloudformation/monitoring-stack.yaml")
 
   parameters = {
-    ProjectName             = var.project_name
-    Environment             = var.environment
-    MonitoringRoleName      = var.monitoring_instance_role_name
+    ProjectName        = var.project_name
+    Environment        = var.environment
+    MonitoringRoleName = var.monitoring_instance_role_name
   }
 
   capabilities = ["CAPABILITY_IAM", "CAPABILITY_NAMED_IAM"]
