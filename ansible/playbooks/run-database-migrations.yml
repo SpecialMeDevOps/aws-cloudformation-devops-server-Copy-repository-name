@@ -29,7 +29,39 @@
           - "{{ lookup('env', 'AWS_REGION') }}"
       register: application_stack_outputs_raw
       changed_when: false
+      failed_when: false
       no_log: true
+
+    - name: Classify application stack read failure safely
+      ansible.builtin.set_fact:
+        application_stack_read_diagnostic: >-
+          {% set error_text = application_stack_outputs_raw.stderr | default('') | lower %}
+          {% if 'does not exist' in error_text or 'not exist' in error_text %}
+          The application stack was not found in the selected AWS account and region.
+          {% elif 'accessdenied' in error_text or 'not authorized' in error_text or 'unauthorized' in error_text %}
+          The Jenkins IAM role is not authorized to describe the application stack.
+          {% elif 'unable to locate credentials' in error_text or 'no credentials' in error_text %}
+          AWS credentials were unavailable to the Ansible process.
+          {% elif 'could not connect' in error_text or 'could not resolve' in error_text or 'connection timed out' in error_text or 'endpoint url' in error_text %}
+          The AWS CLI could not reach the CloudFormation endpoint; check region and agent connectivity.
+          {% else %}
+          AWS CloudFormation DescribeStacks failed; inspect CloudTrail and restricted Jenkins agent logs.
+          {% endif %}
+      when: application_stack_outputs_raw.rc != 0
+      no_log: true
+
+    - name: Report sanitized application stack read failure
+      ansible.builtin.debug:
+        msg: >-
+          CloudFormation DescribeStacks failed with return code
+          {{ application_stack_outputs_raw.rc }}:
+          {{ application_stack_read_diagnostic | trim }}
+      when: application_stack_outputs_raw.rc != 0
+
+    - name: Stop if the application stack outputs could not be read
+      ansible.builtin.fail:
+        msg: "Unable to read application CloudFormation outputs; see the sanitized diagnostic above."
+      when: application_stack_outputs_raw.rc != 0
 
     - name: Parse application outputs
       ansible.builtin.set_fact:
