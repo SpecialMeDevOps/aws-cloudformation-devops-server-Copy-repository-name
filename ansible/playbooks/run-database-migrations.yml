@@ -28,6 +28,20 @@
         app_outputs: "{{ (outputs_raw.stdout | from_json).application_outputs.value }}"
       no_log: true
 
+    - name: Validate private migration network outputs
+      ansible.builtin.assert:
+        that:
+          - app_outputs is mapping
+          - (app_outputs | default({})).get('PrivateSubnetAId', '') is match('^subnet-[0-9a-f]+$')
+          - (app_outputs | default({})).get('PrivateSubnetBId', '') is match('^subnet-[0-9a-f]+$')
+          - (app_outputs | default({})).get('PrivateSubnetAId', '') != (app_outputs | default({})).get('PrivateSubnetBId', '')
+          - (app_outputs | default({})).get('BackendSecurityGroupId', '') is match('^sg-[0-9a-f]+$')
+        fail_msg: >-
+          The application CloudFormation outputs must contain two distinct
+          private subnet IDs (PrivateSubnetAId and PrivateSubnetBId) and a
+          backend security group ID (BackendSecurityGroupId). Values are omitted
+          from this diagnostic; verify the deployed application stack outputs.
+
     - name: Build private task network configuration
       ansible.builtin.set_fact:
         migration_network_configuration:
