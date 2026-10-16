@@ -5,7 +5,7 @@
   gather_facts: false
   vars:
     terraform_directory: "{{ playbook_dir }}/../../terraform"
-    state_bucket: "{{ lookup('env', 'TF_STATE_BUCKET') }}"
+    configured_state_bucket: "{{ lookup('env', 'TF_STATE_BUCKET') | trim }}"
     aws_region: "{{ lookup('env', 'AWS_REGION') }}"
     environment_name: "{{ lookup('env', 'TF_VAR_environment') | default('dev', true) }}"
     project_name: "{{ lookup('env', 'TF_VAR_project_name') | default('it-your-it-house', true) }}"
@@ -14,9 +14,45 @@
       ansible.builtin.assert:
         that:
           - terraform_operation in ['plan', 'apply']
-          - state_bucket | length > 0
           - aws_region | length > 0
-        fail_msg: "Terraform requires a plan/apply mode and configured remote-state bucket and AWS region."
+        fail_msg: "Terraform requires a plan/apply mode and AWS_REGION."
+
+    - name: Use the explicitly configured Terraform state bucket
+      ansible.builtin.set_fact:
+        terraform_state_bucket: "{{ configured_state_bucket }}"
+      when: configured_state_bucket | length > 0
+
+    - name: Resolve the Terraform state bucket from its bootstrap stack
+      ansible.builtin.command:
+        argv:
+          - aws
+          - cloudformation
+          - describe-stacks
+          - --stack-name
+          - "{{ project_name }}-terraform-state"
+          - --query
+          - "Stacks[0].Outputs[?OutputKey=='TerraformStateBucketName'].OutputValue | [0]"
+          - --output
+          - text
+          - --region
+          - "{{ aws_region }}"
+      register: terraform_state_bucket_output
+      changed_when: false
+      when: configured_state_bucket | length == 0
+
+    - name: Save the discovered Terraform state bucket
+      ansible.builtin.set_fact:
+        terraform_state_bucket: "{{ terraform_state_bucket_output.stdout | trim }}"
+      when: configured_state_bucket | length == 0
+
+    - name: Require a valid Terraform state bucket name
+      ansible.builtin.assert:
+        that:
+          - terraform_state_bucket is match("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+        fail_msg: >-
+          No valid Terraform state bucket was configured or found in the
+          {{ project_name }}-terraform-state CloudFormation stack. Bootstrap the
+          retained state stack or set TF_STATE_BUCKET to its output bucket name.
 
     - name: Require deployment settings for an application stack
       ansible.builtin.assert:
@@ -49,7 +85,7 @@
           - terraform
           - init
           - -input=false
-          - -backend-config=bucket={{ state_bucket }}
+          - -backend-config=bucket={{ terraform_state_bucket }}
           - -backend-config=key={{ project_name }}/{{ environment_name }}/terraform.tfstate
           - -backend-config=region={{ aws_region }}
           - -backend-config=encrypt=true
