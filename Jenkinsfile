@@ -229,8 +229,8 @@ pipeline {
       steps {
         sh '''
           set -eu
-          docker build --file Dockerfile --tag it-your-it-house:local .
-          docker build --file backend/Dockerfile --tag it-your-it-house-backend:local backend
+          docker build --pull --no-cache --file Dockerfile --tag it-your-it-house:local .
+          docker build --pull --no-cache --file backend/Dockerfile --tag it-your-it-house-backend:local backend
         '''
       }
     }
@@ -246,19 +246,24 @@ pipeline {
 
             for image in it-your-it-house:local it-your-it-house-backend:local; do
               name="${image%%:*}"
-              "$trivy" image --quiet --scanners vuln --severity CRITICAL,HIGH,MEDIUM,LOW \
-                --format json --output "reports/trivy/${name}-vulnerabilities.json" "$image"
+              if "$trivy" image --quiet --scanners vuln --severity HIGH,CRITICAL --exit-code 1 \
+                --format json --output "reports/trivy/${name}-vulnerabilities.json" "$image"; then
+                :
+              else
+                scan_failed=1
+              fi
+              test -s "reports/trivy/${name}-vulnerabilities.json"
               jq -r '
                 .Results[]? | .Vulnerabilities[]? |
                 [.Severity, .VulnerabilityID, .PkgName, .InstalledVersion, (.FixedVersion // "no known fix")] | @tsv
               ' "reports/trivy/${name}-vulnerabilities.json" > "reports/trivy/${name}-vulnerabilities.txt"
               "$trivy" image --quiet --format cyclonedx \
                 --output "reports/trivy/${name}-sbom.cdx.json" "$image"
-              count="$(jq --arg threshold "$TRIVY_FAIL_ON_SEVERITY" \
+              count="$(jq \
                 '[.Results[]? | .Vulnerabilities[]? |
-                  select(.Severity as $severity | ($threshold | split(",")) | index($severity))] | length' \
+                  select(.Severity == "HIGH" or .Severity == "CRITICAL")] | length' \
                 "reports/trivy/${name}-vulnerabilities.json")"
-              printf '%s threshold findings for %s: %s\\n' "$TRIVY_FAIL_ON_SEVERITY" "$image" "$count"
+              printf 'HIGH,CRITICAL findings for %s: %s\\n' "$image" "$count"
               if [ "$count" -gt 0 ]; then
                 scan_failed=1
               fi
