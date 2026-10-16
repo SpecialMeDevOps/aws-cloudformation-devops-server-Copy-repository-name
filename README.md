@@ -140,7 +140,7 @@ The Compose stack includes frontend, backend, and PostgreSQL. Production secrets
 
 ## Jenkins, GitHub webhook and CI/CD
 
-The Jenkinsfile runs the existing application checks and security gates. AWS deployment is disabled by default and is only eligible on `main` when the `DEPLOY_TO_AWS` parameter is explicitly enabled. Infrastructure changes require a separate Jenkins input approval after the Terraform plan has been archived.
+The Jenkinsfile runs the existing application checks and security gates. AWS deployment is disabled by default and is only eligible on `main` when the `DEPLOY_TO_AWS` parameter is explicitly enabled. The branch gate accepts Jenkins Multibranch `BRANCH_NAME=main` and classic Pipeline Git plugin values `GIT_BRANCH=origin/main` or `GIT_LOCAL_BRANCH=main`. Infrastructure changes require a separate Jenkins input approval after the Terraform plan has been archived.
 
 Files created:
 

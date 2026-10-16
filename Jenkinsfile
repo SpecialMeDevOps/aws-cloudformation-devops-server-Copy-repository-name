@@ -1,3 +1,8 @@
+def isMainBranchBuild() {
+  def branchName = env.BRANCH_NAME ?: env.GIT_BRANCH ?: env.GIT_LOCAL_BRANCH ?: ''
+  return ['main', 'origin/main', 'refs/remotes/origin/main'].contains(branchName)
+}
+
 pipeline {
   agent any
 
@@ -42,7 +47,7 @@ pipeline {
   stages {
     stage('Checkout') {
       steps {
-        echo "Checking out commit ${env.GIT_COMMIT ?: 'unknown'} on branch ${env.BRANCH_NAME ?: 'local'}"
+        echo "Checking out commit ${env.GIT_COMMIT ?: 'unknown'} on branch ${env.BRANCH_NAME ?: env.GIT_BRANCH ?: env.GIT_LOCAL_BRANCH ?: 'unknown'}"
       }
     }
 
@@ -306,7 +311,7 @@ pipeline {
     stage('AWS Authentication') {
       when {
         allOf {
-          branch 'main'
+          expression { isMainBranchBuild() }
           expression { params.DEPLOY_TO_AWS }
           expression { currentBuild.currentResult == 'SUCCESS' }
         }
@@ -343,7 +348,7 @@ pipeline {
     stage('Registry Infrastructure') {
       when {
         allOf {
-          branch 'main'
+          expression { isMainBranchBuild() }
           expression { params.DEPLOY_TO_AWS }
           expression { currentBuild.currentResult == 'SUCCESS' }
         }
@@ -359,7 +364,7 @@ pipeline {
     stage('ECR Publish') {
       when {
         allOf {
-          branch 'main'
+          expression { isMainBranchBuild() }
           expression { params.DEPLOY_TO_AWS }
           expression { currentBuild.currentResult == 'SUCCESS' }
         }
@@ -416,7 +421,7 @@ pipeline {
     stage('Deploy to ECS') {
       when {
         allOf {
-          branch 'main'
+          expression { isMainBranchBuild() }
           expression { params.DEPLOY_TO_AWS }
           expression { currentBuild.currentResult == 'SUCCESS' }
         }
@@ -446,7 +451,7 @@ pipeline {
     stage('Monitoring Verification') {
       when {
         allOf {
-          branch 'main'
+          expression { isMainBranchBuild() }
           expression { params.DEPLOY_TO_AWS }
           expression { currentBuild.currentResult == 'SUCCESS' }
         }
