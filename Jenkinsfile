@@ -329,7 +329,7 @@ pipeline {
             script: 'aws sts get-caller-identity --query Arn --output text',
             returnStdout: true
           ).trim()
-          def assumedRole = callerArn =~ /^arn:[^:]+:sts::[0-9]{12}:assumed-role\/([A-Za-z0-9+=,.@_-]{1,64})\/[^/]+$/
+          def assumedRole = callerArn =~ /^arn:[^:]+:sts::[0-9]{12}:assumed-role\/([A-Za-z0-9+=,.@_-]{1,64})\/[^\/]+$/
           if (!assumedRole.matches()) {
             error('AWS deployment requires the Jenkins EC2 instance-profile assumed-role identity.')
           }
