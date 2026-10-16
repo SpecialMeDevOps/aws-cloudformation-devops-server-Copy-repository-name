@@ -17,6 +17,15 @@
           - aws_region | length > 0
         fail_msg: "Terraform requires a plan/apply mode and AWS_REGION."
 
+    - name: Require the application deployment flag when requested
+      ansible.builtin.assert:
+        that:
+          - lookup('env', 'TF_VAR_deploy_application') | bool
+        fail_msg: >-
+          This approved workflow requires TF_VAR_deploy_application=true;
+          no infrastructure plan or apply was run.
+      when: require_application_deployment | default(false) | bool
+
     - name: Use the explicitly configured Terraform state bucket
       ansible.builtin.set_fact:
         terraform_state_bucket: "{{ configured_state_bucket }}"

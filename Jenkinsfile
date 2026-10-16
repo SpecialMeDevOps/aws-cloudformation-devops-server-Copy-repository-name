@@ -427,23 +427,24 @@ pipeline {
         }
       }
       steps {
-        script {
-          env.TF_VAR_deploy_application = 'true'
-          env.TF_VAR_service_desired_count = '0'
+        withEnv(['TF_VAR_deploy_application=true', 'TF_VAR_service_desired_count=0']) {
+          sh 'ansible-playbook -i localhost, ansible/playbooks/terraform-workflow.yml -e terraform_operation=plan -e require_application_deployment=true'
         }
-        sh 'ansible-playbook -i localhost, ansible/playbooks/terraform-workflow.yml -e terraform_operation=plan'
         archiveArtifacts artifacts: 'reports/terraform-plan.txt', fingerprint: true
         input message: 'Review and approve the application, database, network, and monitoring CloudFormation plan.', ok: 'Approve AWS deployment'
-        sh 'ansible-playbook -i localhost, ansible/playbooks/terraform-workflow.yml -e terraform_operation=apply -e approved_cloudformation_change=true'
+        withEnv(['TF_VAR_deploy_application=true', 'TF_VAR_service_desired_count=0']) {
+          sh 'ansible-playbook -i localhost, ansible/playbooks/terraform-workflow.yml -e terraform_operation=apply -e approved_cloudformation_change=true -e require_application_deployment=true'
+        }
         input message: 'Approve running the reviewed Prisma migration against the configured production database.', ok: 'Approve database migration'
         sh 'ansible-playbook -i localhost, ansible/playbooks/run-database-migrations.yml -e approved_database_migration=true'
-        script {
-          env.TF_VAR_service_desired_count = '1'
+        withEnv(['TF_VAR_deploy_application=true', 'TF_VAR_service_desired_count=1']) {
+          sh 'ansible-playbook -i localhost, ansible/playbooks/terraform-workflow.yml -e terraform_operation=plan -e require_application_deployment=true'
         }
-        sh 'ansible-playbook -i localhost, ansible/playbooks/terraform-workflow.yml -e terraform_operation=plan'
         archiveArtifacts artifacts: 'reports/terraform-plan.txt', fingerprint: true
         input message: 'Approve enabling ECS traffic only after the Prisma migration task succeeded.', ok: 'Approve ECS services'
-        sh 'ansible-playbook -i localhost, ansible/playbooks/terraform-workflow.yml -e terraform_operation=apply -e approved_cloudformation_change=true'
+        withEnv(['TF_VAR_deploy_application=true', 'TF_VAR_service_desired_count=1']) {
+          sh 'ansible-playbook -i localhost, ansible/playbooks/terraform-workflow.yml -e terraform_operation=apply -e approved_cloudformation_change=true -e require_application_deployment=true'
+        }
         sh 'ansible-playbook -i localhost, ansible/playbooks/verify-application.yml'
       }
     }
