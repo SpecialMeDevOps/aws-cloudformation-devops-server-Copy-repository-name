@@ -329,11 +329,10 @@ pipeline {
             script: 'aws sts get-caller-identity --query Arn --output text',
             returnStdout: true
           ).trim()
-          def assumedRole = callerArn =~ /^arn:[^:]+:sts::[0-9]{12}:assumed-role\/([A-Za-z0-9+=,.@_-]{1,64})\/[^\/]+$/
-          if (!assumedRole.matches()) {
+          if (!(callerArn ==~ /^arn:[^:]+:sts::[0-9]{12}:assumed-role\/([A-Za-z0-9+=,.@_-]{1,64})\/[^\/]+$/)) {
             error('AWS deployment requires the Jenkins EC2 instance-profile assumed-role identity.')
           }
-          env.TF_VAR_monitoring_instance_role_name = assumedRole[0][1]
+          env.TF_VAR_monitoring_instance_role_name = callerArn.split('/')[1]
           env.TF_VAR_s3_managed_prefix_list_id = sh(
             script: "aws ec2 describe-managed-prefix-lists --filters Name=prefix-list-name,Values=com.amazonaws.${env.AWS_REGION}.s3 --query 'PrefixLists[0].PrefixListId' --output text",
             returnStdout: true
