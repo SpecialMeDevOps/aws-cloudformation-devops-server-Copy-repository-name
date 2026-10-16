@@ -4,7 +4,8 @@
   connection: local
   gather_facts: false
   vars:
-    terraform_directory: "{{ playbook_dir }}/../../terraform"
+    project_name: "{{ lookup('env', 'TF_VAR_project_name') | default('it-your-it-house', true) }}"
+    environment_name: "{{ lookup('env', 'TF_VAR_environment') | default('dev', true) }}"
   tasks:
     - name: Require explicit migration approval
       ansible.builtin.assert:
@@ -12,20 +13,27 @@
           - approved_database_migration | default(false) | bool
         fail_msg: "Database migrations require explicit approval after reviewing the migration SQL."
 
-    - name: Read application stack outputs
+    - name: Read live application CloudFormation outputs
       ansible.builtin.command:
         argv:
-          - terraform
-          - output
-          - -json
-        chdir: "{{ terraform_directory }}"
-      register: outputs_raw
+          - aws
+          - cloudformation
+          - describe-stacks
+          - --stack-name
+          - "{{ project_name }}-{{ environment_name }}-application"
+          - --query
+          - Stacks[0].Outputs
+          - --output
+          - json
+          - --region
+          - "{{ lookup('env', 'AWS_REGION') }}"
+      register: application_stack_outputs_raw
       changed_when: false
       no_log: true
 
     - name: Parse application outputs
       ansible.builtin.set_fact:
-        app_outputs: "{{ (outputs_raw.stdout | from_json).application_outputs.value }}"
+        app_outputs: "{{ application_stack_outputs_raw.stdout | from_json | items2dict(key_name='OutputKey', value_name='OutputValue') }}"
       no_log: true
 
     - name: Validate private migration network outputs
