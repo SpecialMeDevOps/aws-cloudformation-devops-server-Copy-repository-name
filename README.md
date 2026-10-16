@@ -242,13 +242,16 @@ Ownership is deliberately separated:
 - CloudFormation is the sole owner of AWS resources, including VPC/networking, ECR, ECS/Fargate, RDS, IAM, AMP, and AMG.
 - Ansible performs Jenkins-agent preflight, invokes Terraform, runs a separately approved Prisma migration task, and verifies ECS/ALB/AMP/AMG health. It does not create duplicate AWS resources.
 
-The remote Terraform backend is an S3 bucket bootstrapped once from `cloudformation/terraform-state-stack.yaml`. The bucket has versioning, encryption, public-access blocking, TLS-only access, and S3 lock files. Bootstrap is an AWS change and is not run automatically by this repo work. An authorized operator must execute this from the approved Jenkins/EC2 environment after reviewing the template:
+The remote Terraform backend is an S3 bucket bootstrapped from `cloudformation/terraform-state-stack.yaml`. The bucket has versioning, customer-managed KMS encryption, public-access blocking, TLS-only access, and S3 lock files. The bootstrap stack creates and retains the KMS key, enables rotation, and grants the named Jenkins EC2 role key access. Bootstrap is an AWS change and is not run automatically by this repo work. An authorized operator must execute this from the approved Jenkins/EC2 environment after reviewing the template:
 
 ```sh
 aws cloudformation deploy \
   --stack-name it-your-it-house-terraform-state \
   --template-file cloudformation/terraform-state-stack.yaml \
-  --parameter-overrides ProjectName=it-your-it-house \
+  --capabilities CAPABILITY_IAM \
+  --parameter-overrides \
+    ProjectName=it-your-it-house \
+    TerraformStateRoleName="${TF_VAR_monitoring_instance_role_name:?Set the Jenkins EC2 instance-profile role name}" \
   --region us-east-1
 
 aws cloudformation describe-stacks \
@@ -258,7 +261,7 @@ aws cloudformation describe-stacks \
   --region us-east-1
 ```
 
-Configure the returned bucket name as the Jenkins environment variable `TF_STATE_BUCKET`, and ensure the EC2 instance profile can read/write/delete the state object and `.tflock` object. Terraform >=1.10 is required for S3 lock-file support.
+Configure the returned bucket name as the Jenkins environment variable `TF_STATE_BUCKET`. The stack grants the selected EC2 instance-profile role access to the state KMS key; that role must also be authorized to read/write/delete the state object and `.tflock` object in S3. When updating an existing bootstrap stack, review the CloudFormation change set and keep the retained state bucket and KMS key. Terraform >=1.10 is required for S3 lock-file support.
 
 **Do not enable `DEPLOY_TO_AWS` until the prior Terraform state and AWS ownership are reconciled.** The historical config managed ECR repositories and a VPC directly. The current Terraform has non-destroying `removed` blocks to protect those prior addresses only if the old state is recovered and migrated. If a repository, VPC, or stack already exists without a matching CloudFormation stack in the active remote state, Terraform cannot safely adopt it automatically. Import or migrate the existing resources/state in a separately reviewed change first. Do not apply a plan that proposes replacement or deletion. `destroy = false` intentionally leaves old resources alive and unmanaged; an old VPC may include a billable NAT gateway, so inventory and migrate/retire it through an approved change before creating a duplicate network.
 
@@ -278,7 +281,7 @@ Jenkins setup:
 
 ## Security, scanning and release gates
 
-Semgrep, npm audit, Trivy filesystem/secret/configuration/image scans, CycloneDX SBOMs, frontend/backend lint/type checking, Prisma validation, tests, and build checks are wired into Jenkins. The Trivy severity gate defaults to CRITICAL and is adjustable via the pipeline parameter. Terraform plans require manual approval; AWS publishing/deployment is gated by `DEPLOY_TO_AWS` and `main`.
+Semgrep, npm audit, Trivy filesystem/secret/configuration/image scans, CycloneDX SBOMs, frontend/backend lint/type checking, Prisma validation, tests, and build checks are wired into Jenkins. The Trivy severity gate defaults to HIGH and CRITICAL and is adjustable via the pipeline parameter. `ci/.trivyignore.yaml` contains one path-scoped AWS-0053 exception for the intentionally public application ALB; its ingress CIDR must be supplied explicitly, and the Jenkins deployment preflight rejects `0.0.0.0/0`. Terraform plans require manual approval; AWS publishing/deployment is gated by `DEPLOY_TO_AWS` and `main`.
 
 CloudFormation templates, remote state, and the Jenkins host have not been validated or deployed against the target AWS account. Add dedicated `cfn-lint`, `ansible-lint`, and Terraform security scanning (for example Checkov) only after pinning versions, reviewing their policy behavior, and adding CI reports. Do not describe the Jenkins host setup playbook as a real scan.
 

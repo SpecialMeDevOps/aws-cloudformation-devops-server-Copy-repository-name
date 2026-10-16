@@ -31,8 +31,8 @@ Parameters:
     Description: ACM certificate ARN in this region; the application load balancer serves HTTPS only.
   AllowedWebIngressCidr:
     Type: String
-    Default: "0.0.0.0/0"
     AllowedPattern: "([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])"
+    ConstraintDescription: Provide an explicit trusted client CIDR; 0.0.0.0/0 is not allowed.
   DbInstanceClass:
     Type: String
     Default: db.t4g.micro
@@ -315,7 +315,7 @@ Resources:
       SecurityGroupIds:
         - !Ref VpcEndpointsSecurityGroup
 
-  AmpRemoteWriteEndpoint:
+  AmpWorkspacesVpcEndpoint:
     Type: AWS::EC2::VPCEndpoint
     Properties:
       VpcEndpointType: Interface
@@ -724,7 +724,7 @@ Resources:
       - EcrDockerEndpoint
       - CloudWatchLogsEndpoint
       - SecretsManagerEndpoint
-      - AmpRemoteWriteEndpoint
+      - AmpWorkspacesVpcEndpoint
       - S3GatewayEndpoint
     Properties:
       ServiceName: !Sub "${ProjectName}-${Environment}-backend"

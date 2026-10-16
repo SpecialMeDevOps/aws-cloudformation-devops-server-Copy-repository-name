@@ -4,8 +4,8 @@ pipeline {
   parameters {
     choice(
       name: 'TRIVY_FAIL_ON_SEVERITY',
-      choices: ['CRITICAL', 'HIGH,CRITICAL', 'MEDIUM,HIGH,CRITICAL', 'LOW,MEDIUM,HIGH,CRITICAL'],
-      description: 'Lowest Trivy severity that fails a scan. Defaults to CRITICAL.'
+      choices: ['HIGH,CRITICAL', 'CRITICAL', 'MEDIUM,HIGH,CRITICAL', 'LOW,MEDIUM,HIGH,CRITICAL'],
+      description: 'Lowest Trivy severity that fails a scan. Defaults to HIGH,CRITICAL.'
     )
     booleanParam(
       name: 'DEPLOY_TO_AWS',
@@ -177,11 +177,12 @@ pipeline {
               [.Severity, .VulnerabilityID, .PkgName, .InstalledVersion, (.FixedVersion // "no known fix")] | @tsv
             ' reports/trivy/filesystem-vulnerabilities.json > reports/trivy/filesystem-vulnerabilities.txt
 
-            "$trivy" config --quiet --severity CRITICAL,HIGH,MEDIUM,LOW \
+            "$trivy" config --quiet --ignorefile ci/.trivyignore.yaml \
+              --severity CRITICAL,HIGH,MEDIUM,LOW \
               --format json --output reports/trivy/infrastructure-misconfigurations.json .
             jq -r '
-              .Results[]? | .Misconfigurations[]? |
-              [.Severity, .ID, .Title, .CauseMetadata.Resource] | @tsv
+              .Results[]? as $result | $result.Misconfigurations[]? |
+              [.Severity, .ID, $result.Target, .CauseMetadata.StartLine, .Title, .CauseMetadata.Resource] | @tsv
             ' reports/trivy/infrastructure-misconfigurations.json > reports/trivy/infrastructure-misconfigurations.txt
 
             "$trivy" fs --quiet --scanners secret --severity CRITICAL,HIGH,MEDIUM,LOW \
@@ -206,6 +207,26 @@ pipeline {
             printf 'Threshold %s: filesystem=%s config=%s secrets=%s\\n' \
               "$TRIVY_FAIL_ON_SEVERITY" "$vulnerability_count" "$config_count" "$secret_count"
             if [ "$vulnerability_count" -gt 0 ] || [ "$config_count" -gt 0 ] || [ "$secret_count" -gt 0 ]; then
+              if [ "$vulnerability_count" -gt 0 ]; then
+                echo 'Filesystem findings (severity, CVE, target, package, title):'
+                jq -r --arg threshold "$TRIVY_FAIL_ON_SEVERITY" '
+                  .Results[]? as $result | $result.Vulnerabilities[]? |
+                  select(.Severity as $severity | ($threshold | split(",")) | index($severity)) |
+                  [.Severity, .VulnerabilityID, $result.Target, .PkgName, .Title] | @tsv
+                ' reports/trivy/filesystem-vulnerabilities.json
+              fi
+              if [ "$config_count" -gt 0 ]; then
+                echo 'Infrastructure findings (severity, ID, target, line, title):'
+                jq -r --arg threshold "$TRIVY_FAIL_ON_SEVERITY" '
+                  .Results[]? as $result | $result.Misconfigurations[]? |
+                  select(.Severity as $severity | ($threshold | split(",")) | index($severity)) |
+                  [.Severity, .ID, $result.Target, (.CauseMetadata.StartLine // 0), .Title] | @tsv
+                ' reports/trivy/infrastructure-misconfigurations.json
+              fi
+              if [ "$secret_count" -gt 0 ]; then
+                echo 'Secret findings (values omitted):'
+                cat reports/trivy/secrets-redacted.txt
+              fi
               exit 1
             fi
           '''

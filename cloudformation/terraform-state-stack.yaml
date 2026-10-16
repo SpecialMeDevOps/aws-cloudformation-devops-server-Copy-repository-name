@@ -6,8 +6,53 @@ Parameters:
     Type: String
     Default: it-your-it-house
     AllowedPattern: "[a-z0-9][a-z0-9-]*"
+  TerraformStateRoleName:
+    Type: String
+    Description: Existing Jenkins EC2 instance-profile role that reads and writes Terraform state.
+    AllowedPattern: "[A-Za-z0-9+=,.@_-]{1,64}"
 
 Resources:
+  TerraformStateKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub "Customer-managed encryption key for ${ProjectName} Terraform state."
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableAccountIAMPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+
+  TerraformStateKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-terraform-state"
+      TargetKeyId: !Ref TerraformStateKey
+
+  TerraformStateRoleKeyPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-terraform-state-kms"
+      Roles:
+        - !Ref TerraformStateRoleName
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: UseTerraformStateKey
+            Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:Encrypt
+              - kms:GenerateDataKey
+            Resource: !GetAtt TerraformStateKey.Arn
+
   TerraformStateBucket:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain
@@ -19,7 +64,9 @@ Resources:
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt TerraformStateKey.Arn
+            BucketKeyEnabled: true
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true

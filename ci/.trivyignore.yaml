@@ -1,0 +1,8 @@
+misconfigurations:
+  - id: AWS-0053
+    paths:
+      - cloudformation/application-stack.yaml
+    statement: >-
+      This application intentionally uses a public ALB. Application deployment
+      requires an explicit trusted ingress CIDR; the template no longer defaults
+      to 0.0.0.0/0, and the Jenkins deployment preflight rejects that CIDR.
