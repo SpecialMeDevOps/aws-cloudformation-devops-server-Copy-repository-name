@@ -267,7 +267,92 @@ The Ansible Terraform workflow reads the bucket name from the `TerraformStateBuc
 
 Application and monitoring stacks are created only on the `main` branch when `DEPLOY_TO_AWS=true`; Jenkins pauses for plan approval. The first application release creates a generated-password PostgreSQL database and runs the checked-in additive Prisma migration as a separate ECS task. Do not use this initial migration against an existing database without first checking/baselining its schema and making a tested backup.
 
-These stacks create billable AWS resources (including NAT gateway/EIP, ALB, RDS, Fargate, CloudWatch Container Insights, AMP, and AMG). Review a current account/region-specific estimate and the Terraform plan before each approval. No cost estimate or live AWS resource validation has been performed for this change.
+The current templates create billable resources including an ALB, RDS, Fargate tasks, interface VPC endpoints, CloudWatch Container Insights/log ingestion, Amazon Managed Prometheus (AMP), Amazon Managed Grafana (AMG), ECR image storage, public IPv4 addresses, and data transfer. The application template does not define a NAT Gateway or Elastic IP. AMP/AMG, RDS, the ALB, interface endpoints, and public IPv4 charges can accrue while idle; actual charges vary by region, usage, and duration. Estimate the planned lifetime in the AWS Pricing Calculator and inspect the Terraform plan before every approval. No live deployment or account-specific cost estimate is claimed.
+
+### Temporary portfolio demo: HTTPS requirements and cleanup
+
+The current application ALB accepts HTTPS only and requires an ACM certificate. A CloudFront default hostname would encrypt browser-to-CloudFront traffic, but CloudFront must also connect securely to its ALB origin. The ALB needs an issued certificate matching the origin hostname; its AWS-generated ALB DNS name cannot be covered by a certificate you request for a hostname you do not control. Using an HTTP CloudFront origin would send OTP and session-token API traffic without TLS between CloudFront and the ALB, so this repository intentionally does not configure that path. No CloudFront distribution is created by this pipeline. Keep the current HTTPS checks; use a DNS hostname you control plus its issued `us-east-1` ACM certificate, or do not deploy this ALB application.
+
+Before an approved temporary demo deployment, collect and verify this checklist:
+
+- Jenkins build is from `main`; set `DEPLOY_TO_AWS=true`. Keep the Trivy gate at `HIGH,CRITICAL` (the default) and approve only the reviewed Terraform plans and database migration.
+- `APPLICATION_HOSTNAME`: fully qualified DNS name you control. `ACM_CERTIFICATE_ARN`: ACM certificate in `us-east-1`, status `ISSUED`, covering that exact hostname (or a matching one-label wildcard). Jenkins checks these before registry infrastructure or image publication.
+- `ALLOWED_WEB_INGRESS_CIDR`: canonical IPv4 network for trusted demo viewers, preferably a single known viewer address as `/32`. The pipeline rejects `/0`; do not use `0.0.0.0/0`.
+- Jenkins uses the EC2 instance profile; its assumed-role ARN is used to derive the existing role name. The role must have only reviewed deployment permissions, including `acm:DescribeCertificate` scoped to the selected certificate, the required ECR/CloudFormation/ECS/RDS/Secrets Manager/CloudWatch/AMP/AMG actions, and narrowly scoped `iam:PassRole`. Do not deploy while the role has broad administrator permissions.
+- The Terraform S3 backend must resolve to the existing bootstrap state bucket, and its current state must be reconciled with AWS ownership. Review the plan for replacement/deletion of anything that predates this demo and stop if it contains unexpected resources.
+- Frontend/backend images and SHA-256 digests are built, scanned, pushed, and checked by the existing Jenkins stages; do not manually supply or substitute digests.
+- After the application stack is created, point DNS for `APPLICATION_HOSTNAME` at the ALB DNS name displayed by Jenkins. Verify HTTPS and the health endpoints before approving the migration. The existing migration and service-enable approvals remain required.
+- For screenshots of AMG, first assign an approved user through AWS IAM Identity Center. Store a Grafana service-account token in the Jenkins Secret Text credential `grafana-api-token`; use it only for dashboard provisioning. The Grafana workspace URL is printed by the pipeline. Never publish tokens, OTPs, session values, or database details in screenshots.
+
+This is not a zero-cost deployment. The ALB, RDS instance/storage/backups, two Fargate services, interface VPC endpoints, AMP/AMG workspaces, CloudWatch logs/Container Insights, ECR storage, public IPv4 addresses, and data transfer can all incur charges. The RDS database, ALB deletion protection, and retained ECR repositories require explicit cleanup steps; CloudFormation snapshots the database when its stack is deleted. A final snapshot and retained ECR images continue to incur storage charges until deliberately removed.
+
+After the screenshots, clean up only after confirming the AWS account, region, stack names, Terraform backend, and resources belong to this temporary demo. Run this from the same initialized Terraform workspace/backend used for deployment:
+
+1. Inspect the physical IDs for the exact application database and ALB:
+
+   ```sh
+   aws cloudformation describe-stack-resources \
+     --stack-name it-your-it-house-dev-application \
+     --region us-east-1 \
+     --query "StackResources[?LogicalResourceId=='Database' || LogicalResourceId=='LoadBalancer'].[LogicalResourceId,PhysicalResourceId]" \
+     --output table
+   ```
+
+2. Only after verifying both returned IDs belong to this demo, disable their deletion protections so CloudFormation can remove the stack. Substitute the physical IDs returned above; do not guess them:
+
+   ```sh
+   aws rds modify-db-instance \
+     --db-instance-identifier '<verified-Database-physical-id>' \
+     --no-deletion-protection \
+     --apply-immediately \
+     --region us-east-1
+
+   aws elbv2 modify-load-balancer-attributes \
+     --load-balancer-arn '<verified-LoadBalancer-physical-id>' \
+     --attributes Key=deletion_protection.enabled,Value=false \
+     --region us-east-1
+   ```
+
+   Wait for RDS to return to `available`, then verify deletion protection is false and the ALB attribute is false before continuing.
+
+3. Create and inspect a destroy plan. With the Jenkinsfile's default `TF_VAR_deploy_application=false`, the application and monitoring CloudFormation stacks in state are removed, and Terraform also plans to delete its managed registry stack. Do not run `terraform destroy` from a fresh/uninitialized local state. Review the plan and proceed only if every deletion is an expected demo-owned CloudFormation stack; stop for any other deletion. Applying this reviewed plan does not delete the separately bootstrapped Terraform state stack/bucket:
+
+   ```sh
+   terraform -chdir=terraform plan -destroy -input=false -out=demo-cleanup.tfplan
+   terraform -chdir=terraform show -no-color demo-cleanup.tfplan
+   # After reviewing and approving the saved plan:
+   terraform -chdir=terraform apply -input=false demo-cleanup.tfplan
+   ```
+
+4. The application database has `DeletionPolicy: Snapshot`; inspect the manual snapshots for the verified database and delete only the final snapshot created during cleanup if its data is no longer required:
+
+   ```sh
+   aws rds describe-db-snapshots \
+     --db-instance-identifier '<verified-Database-physical-id>' \
+     --snapshot-type manual \
+     --region us-east-1 \
+     --query 'DBSnapshots[].{Snapshot:DBSnapshotIdentifier,Created:SnapshotCreateTime,Status:Status}' \
+     --output table
+
+   aws rds delete-db-snapshot \
+     --db-snapshot-identifier '<verified-demo-final-snapshot-id>' \
+     --region us-east-1
+   ```
+
+   The registry repositories have `DeletionPolicy: Retain`, so deleting the registry stack leaves ECR repositories and images behind. Verify repository ownership, tags, creation time, and that no other workload uses them before deliberately deleting those exact demo repositories/images. Do not delete pre-existing or shared repositories:
+
+   ```sh
+   aws ecr delete-repository \
+     --repository-name it-your-it-house-frontend \
+     --force \
+     --region us-east-1
+   aws ecr delete-repository \
+     --repository-name it-your-it-house-backend \
+     --force \
+     --region us-east-1
+   ```
+5. Confirm the application and monitoring CloudFormation stacks are gone and ECS tasks/services, ALB, RDS instance, AMP, AMG, VPC endpoints, log groups, and stack-created IAM policies/roles are removed. Remove any demo-only Grafana Jenkins credential and any demo-specific Grafana user assignment only after confirming they are not shared.
+6. Do not delete `it-your-it-house-terraform-state`, its S3 state bucket, its KMS key, Terraform state/lock objects, the Jenkins EC2 role, or unrelated resources. This deployment creates no CloudFront distribution; if a separately approved change creates one later, identify it by its exact stack/state ownership and remove it separately.
 
 Jenkins setup:
 
