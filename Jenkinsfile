@@ -42,6 +42,7 @@ pipeline {
   }
 
   environment {
+    PATH+CI_TOOLS = "${WORKSPACE}@tmp/ci-tools/bin"
     NODE_ENV = 'test'
     APP_NAME = 'it-your-it-house'
     AWS_REGION = 'us-east-1'
@@ -72,6 +73,7 @@ pipeline {
 
     stage('CI Agent Preflight') {
       steps {
+        sh 'bash scripts/install-ci-tools.sh'
         sh 'ansible-playbook -i localhost, ansible/playbooks/preflight.yml'
       }
     }
