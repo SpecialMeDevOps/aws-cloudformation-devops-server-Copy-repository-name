@@ -17,6 +17,24 @@ pipeline {
       defaultValue: false,
       description: 'Enable the approved AWS infrastructure, ECR, ECS, and monitoring workflow on main.'
     )
+    string(
+      name: 'APPLICATION_HOSTNAME',
+      defaultValue: '',
+      trim: true,
+      description: 'DNS hostname you control for the HTTPS application URL; point its DNS record at the ALB when prompted.'
+    )
+    string(
+      name: 'ACM_CERTIFICATE_ARN',
+      defaultValue: '',
+      trim: true,
+      description: 'Issued ACM certificate ARN in AWS_REGION whose names include APPLICATION_HOSTNAME.'
+    )
+    string(
+      name: 'ALLOWED_WEB_INGRESS_CIDR',
+      defaultValue: '',
+      trim: true,
+      description: 'Trusted IPv4 client CIDR allowed to access the ALB; do not use 0.0.0.0/0.'
+    )
   }
 
   tools {
@@ -35,6 +53,9 @@ pipeline {
     TF_VAR_environment = 'dev'
     TF_VAR_deploy_application = 'false'
     TF_VAR_service_desired_count = '1'
+    TF_VAR_application_hostname = "${params.APPLICATION_HOSTNAME}"
+    TF_VAR_certificate_arn = "${params.ACM_CERTIFICATE_ARN}"
+    TF_VAR_allowed_web_ingress_cidr = "${params.ALLOWED_WEB_INGRESS_CIDR}"
   }
 
   options {
@@ -341,6 +362,65 @@ pipeline {
             error('AWS did not return the regional managed S3 prefix list ID.')
           }
         }
+        sh '''#!/usr/bin/env bash
+          set -euo pipefail
+
+          node <<'NODE'
+          const net = require('node:net');
+          const hostname = process.env.TF_VAR_application_hostname;
+          const certificateArn = process.env.TF_VAR_certificate_arn;
+          const ingress = process.env.TF_VAR_allowed_web_ingress_cidr;
+          const region = process.env.AWS_REGION;
+
+          if (!/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i.test(hostname)) {
+            throw new Error('APPLICATION_HOSTNAME must be a fully qualified hostname you control.');
+          }
+          if (!new RegExp('^arn:aws:acm:' + region + ':[0-9]{12}:certificate/[0-9a-f-]{36}$', 'i').test(certificateArn)) {
+            throw new Error('ACM_CERTIFICATE_ARN must be a certificate ARN in AWS_REGION.');
+          }
+
+          const [address, prefix, ...extra] = ingress.split('/');
+          if (extra.length || net.isIP(address) !== 4 || !/^(?:[1-9]|[12][0-9]|3[0-2])$/.test(prefix)) {
+            throw new Error('ALLOWED_WEB_INGRESS_CIDR must be a valid, explicitly scoped IPv4 CIDR; /0 is not allowed.');
+          }
+          const octets = address.split('.').map(Number);
+          const numericAddress = octets.reduce((value, octet) => value * 256 + octet, 0);
+          const mask = (0xffffffff << (32 - Number(prefix))) >>> 0;
+          if (((numericAddress & mask) >>> 0) !== numericAddress || ingress === '0.0.0.0/0') {
+            throw new Error('ALLOWED_WEB_INGRESS_CIDR must be a canonical network range and cannot be 0.0.0.0/0.');
+          }
+NODE
+
+          certificate="$(aws acm describe-certificate \
+            --certificate-arn "$TF_VAR_certificate_arn" \
+            --region "$AWS_REGION" \
+            --query 'Certificate.{Status:Status,DomainName:DomainName,SubjectAlternativeNames:SubjectAlternativeNames}' \
+            --output json)"
+          printf '%s' "$certificate" | node -e '
+            let raw = "";
+            process.stdin.setEncoding("utf8");
+            process.stdin.on("data", chunk => raw += chunk);
+            process.stdin.on("end", () => {
+              const certificate = JSON.parse(raw);
+              const hostname = process.env.TF_VAR_application_hostname.toLowerCase();
+              const names = [certificate.DomainName, ...(certificate.SubjectAlternativeNames || [])]
+                .filter(Boolean)
+                .map(name => name.toLowerCase());
+              const matchesHostname = names.some(name => {
+                if (name === hostname) return true;
+                if (!name.startsWith("*.")) return false;
+                const hostnameLabels = hostname.split(".");
+                const certificateLabels = name.split(".");
+                return hostnameLabels.length === certificateLabels.length &&
+                  hostnameLabels.slice(1).join(".") === certificateLabels.slice(1).join(".");
+              });
+              if (certificate.Status !== "ISSUED" || !matchesHostname) {
+                console.error("The ACM certificate must be ISSUED and cover APPLICATION_HOSTNAME.");
+                process.exitCode = 1;
+              }
+            });
+          '
+        '''
         sh '''
           set -eu
           for template in cloudformation/*.yaml; do
@@ -443,7 +523,17 @@ pipeline {
         withEnv(['TF_VAR_deploy_application=true', 'TF_VAR_service_desired_count=0']) {
           sh 'ansible-playbook -i localhost, ansible/playbooks/terraform-workflow.yml -e terraform_operation=apply -e approved_cloudformation_change=true -e require_application_deployment=true'
         }
-        input message: 'Approve running the reviewed Prisma migration against the configured production database.', ok: 'Approve database migration'
+        script {
+          env.APPLICATION_ALB_DNS_NAME = sh(
+            script: "terraform -chdir=terraform output -json | jq -r '.application_outputs.value.LoadBalancerDnsName'",
+            returnStdout: true
+          ).trim()
+          if (!env.APPLICATION_ALB_DNS_NAME || env.APPLICATION_ALB_DNS_NAME == 'null') {
+            error('Terraform did not return the application ALB DNS name.')
+          }
+          echo "Before approving migration, point DNS for ${env.TF_VAR_application_hostname} at ${env.APPLICATION_ALB_DNS_NAME} and verify its HTTPS certificate."
+        }
+        input message: "After pointing DNS for ${env.TF_VAR_application_hostname} at ${env.APPLICATION_ALB_DNS_NAME}, approve the reviewed Prisma migration.", ok: 'Approve database migration'
         sh 'ansible-playbook -i localhost, ansible/playbooks/run-database-migrations.yml -e approved_database_migration=true'
         withEnv(['TF_VAR_deploy_application=true', 'TF_VAR_service_desired_count=1']) {
           sh 'ansible-playbook -i localhost, ansible/playbooks/terraform-workflow.yml -e terraform_operation=plan -e require_application_deployment=true'

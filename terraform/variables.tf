@@ -42,23 +42,36 @@ variable "backend_image_uri" {
   }
 }
 
-variable "certificate_arn" {
-  description = "Optional ACM certificate ARN in the deployment region."
+variable "application_hostname" {
+  description = "Fully qualified DNS hostname served over HTTPS and covered by the ACM certificate."
   type        = string
   default     = ""
   validation {
-    condition     = !var.deploy_application || length(trimspace(var.certificate_arn)) > 0
-    error_message = "Application deployment requires an ACM certificate ARN so the ALB uses HTTPS."
+    condition     = !var.deploy_application || (length(var.application_hostname) <= 253 && can(regex("^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)+[A-Za-z]{2,63}$", var.application_hostname)))
+    error_message = "Application deployment requires a valid fully qualified application hostname."
+  }
+}
+
+variable "certificate_arn" {
+  description = "Issued ACM certificate ARN in the deployment region covering application_hostname."
+  type        = string
+  default     = ""
+  validation {
+    condition     = !var.deploy_application || can(regex("^arn:aws:acm:${var.aws_region}:[0-9]{12}:certificate/[0-9a-fA-F-]{36}$", var.certificate_arn))
+    error_message = "Application deployment requires an ACM certificate ARN in aws_region."
   }
 }
 
 variable "allowed_web_ingress_cidr" {
   description = "CIDR allowed to access the public application load balancer."
   type        = string
-  default     = "0.0.0.0/0"
+  default     = ""
   validation {
-    condition     = !var.deploy_application || (can(cidrhost(var.allowed_web_ingress_cidr, 0)) && var.allowed_web_ingress_cidr != "0.0.0.0/0")
-    error_message = "Application deployment requires a valid, narrowly allowlisted ALB CIDR instead of 0.0.0.0/0."
+    condition = !var.deploy_application || (
+      can(regex("^([0-9]{1,3}\\.){3}[0-9]{1,3}/([1-9]|[12][0-9]|3[0-2])$", var.allowed_web_ingress_cidr)) &&
+      can(cidrhost(var.allowed_web_ingress_cidr, 0) == split("/", var.allowed_web_ingress_cidr)[0])
+    )
+    error_message = "Application deployment requires a valid, explicitly scoped IPv4 ALB CIDR; /0 is not allowed."
   }
 }
 

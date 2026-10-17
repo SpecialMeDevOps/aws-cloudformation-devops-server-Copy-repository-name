@@ -69,14 +69,14 @@
           - lookup('env', 'TF_VAR_monitoring_instance_role_name') | length > 0
           - lookup('env', 'TF_VAR_frontend_image_uri') is match(".+@sha256:[a-f0-9]{64}")
           - lookup('env', 'TF_VAR_backend_image_uri') is match(".+@sha256:[a-f0-9]{64}")
-          - lookup('env', 'TF_VAR_certificate_arn') | length > 0
-          - lookup('env', 'TF_VAR_allowed_web_ingress_cidr') | length > 0
-          - lookup('env', 'TF_VAR_allowed_web_ingress_cidr') != '0.0.0.0/0'
+          - lookup('env', 'TF_VAR_application_hostname') is match("^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)+[A-Za-z]{2,63}$")
+          - lookup('env', 'TF_VAR_certificate_arn') is match("^arn:aws:acm:" ~ aws_region ~ ":[0-9]{12}:certificate/[0-9a-fA-F-]{36}$")
+          - lookup('env', 'TF_VAR_allowed_web_ingress_cidr') is match("^([0-9]{1,3}\\.){3}[0-9]{1,3}/([1-9]|[12][0-9]|3[0-2])$")
         fail_msg: >-
           Application deployment requires the Jenkins EC2 role name for scoped
-          monitoring access, both scanned ECR image digests, and a trusted,
-          explicitly configured allowlisted ALB ingress CIDR rather than 0.0.0.0/0,
-          and a valid ACM certificate for HTTPS.
+          monitoring access, both scanned ECR image digests, a hostname and
+          matching ACM certificate for HTTPS, and an explicitly scoped IPv4
+          ALB ingress CIDR. Values are supplied by Jenkins build parameters.
       when:
         - terraform_operation == 'plan'
         - lookup('env', 'TF_VAR_deploy_application') | bool

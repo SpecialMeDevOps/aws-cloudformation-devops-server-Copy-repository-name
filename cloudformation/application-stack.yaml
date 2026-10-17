@@ -8,6 +8,10 @@ Parameters:
   Environment:
     Type: String
     Default: dev
+  ApplicationHostname:
+    Type: String
+    AllowedPattern: "^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)+[A-Za-z]{2,63}$"
+    ConstraintDescription: Provide the DNS hostname covered by the ACM certificate and pointed at this load balancer.
   FrontendImageUri:
     Type: String
     AllowedPattern: ".+@sha256:[a-f0-9]{64}"
@@ -28,10 +32,11 @@ Parameters:
     Description: Region-specific AWS-managed S3 prefix list ID for ECR image layer downloads.
   CertificateArn:
     Type: String
+    AllowedPattern: "^arn:aws:acm:[a-z0-9-]+:[0-9]{12}:certificate/[0-9a-fA-F-]{36}$"
     Description: ACM certificate ARN in this region; the application load balancer serves HTTPS only.
   AllowedWebIngressCidr:
     Type: String
-    AllowedPattern: "([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])"
+    AllowedPattern: "([0-9]{1,3}\\.){3}[0-9]{1,3}/([1-9]|[1-2][0-9]|3[0-2])"
     ConstraintDescription: Provide an explicit trusted client CIDR; 0.0.0.0/0 is not allowed.
   DbInstanceClass:
     Type: String
@@ -828,7 +833,7 @@ Outputs:
   LoadBalancerDnsName:
     Value: !GetAtt LoadBalancer.DNSName
   ApplicationUrl:
-    Value: !Sub "https://${LoadBalancer.DNSName}"
+    Value: !Sub "https://${ApplicationHostname}"
   DatabaseEndpoint:
     Value: !GetAtt Database.Endpoint.Address
   DatabaseSecretArn:

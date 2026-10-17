@@ -48,6 +48,7 @@ resource "aws_cloudformation_stack" "application" {
   parameters = {
     ProjectName            = var.project_name
     Environment            = var.environment
+    ApplicationHostname    = var.application_hostname
     FrontendImageUri       = var.frontend_image_uri
     BackendImageUri        = var.backend_image_uri
     CertificateArn         = var.certificate_arn
