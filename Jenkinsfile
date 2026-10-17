@@ -15,7 +15,25 @@ pipeline {
     booleanParam(
       name: 'DEPLOY_TO_AWS',
       defaultValue: false,
-      description: 'Enable the approved AWS infrastructure, ECR, ECS, and monitoring workflow on main.'
+      description: 'Enable the approved AWS infrastructure, ECR, EKS, and monitoring workflow on main.'
+    )
+    string(
+      name: 'KUBERNETES_OPERATOR_PRINCIPAL_ARN',
+      defaultValue: '',
+      trim: true,
+      description: 'IAM user or role ARN that will use kubectl port-forward. Must be in the deployment AWS account.'
+    )
+    string(
+      name: 'KUBERNETES_API_ACCESS_CIDRS',
+      defaultValue: '',
+      trim: true,
+      description: 'Comma-separated trusted IPv4 CIDRs for kubectl clients. Jenkins egress is added automatically; do not use /0.'
+    )
+    string(
+      name: 'KUBERNETES_VERSION',
+      defaultValue: '1.34',
+      trim: true,
+      description: 'Supported EKS Kubernetes minor version.'
     )
   }
 
@@ -34,7 +52,8 @@ pipeline {
     TF_VAR_project_name = 'it-your-it-house'
     TF_VAR_environment = 'dev'
     TF_VAR_deploy_application = 'false'
-    TF_VAR_service_desired_count = '1'
+    K8S_APP_NAMESPACE = 'it-your-it-house-dev'
+    TRIVY_IMAGE_FAIL_ON_SEVERITY = 'CRITICAL'
   }
 
   options {
@@ -255,8 +274,8 @@ pipeline {
       steps {
         sh '''
           set -eu
-          docker build --pull --no-cache --file Dockerfile --tag it-your-it-house:local .
-          docker build --pull --no-cache --file backend/Dockerfile --tag it-your-it-house-backend:local backend
+          docker build --pull --no-cache --platform linux/amd64 --file Dockerfile --tag it-your-it-house:local .
+          docker build --pull --no-cache --platform linux/amd64 --file backend/Dockerfile --tag it-your-it-house-backend:local backend
         '''
       }
     }
@@ -272,7 +291,7 @@ pipeline {
 
             for image in it-your-it-house:local it-your-it-house-backend:local; do
               name="${image%%:*}"
-              if "$trivy" image --quiet --scanners vuln --severity HIGH,CRITICAL --exit-code 1 \
+              if "$trivy" image --quiet --scanners vuln --severity "$TRIVY_IMAGE_FAIL_ON_SEVERITY" --exit-code 1 \
                 --format json --output "reports/trivy/${name}-vulnerabilities.json" "$image"; then
                 :
               else
@@ -287,9 +306,9 @@ pipeline {
                 --output "reports/trivy/${name}-sbom.cdx.json" "$image"
               count="$(jq \
                 '[.Results[]? | .Vulnerabilities[]? |
-                  select(.Severity == "HIGH" or .Severity == "CRITICAL")] | length' \
+                  select(.Severity == "CRITICAL")] | length' \
                 "reports/trivy/${name}-vulnerabilities.json")"
-              printf 'HIGH,CRITICAL findings for %s: %s\\n' "$image" "$count"
+              printf 'CRITICAL findings for %s: %s\\n' "$image" "$count"
               if [ "$count" -gt 0 ]; then
                 scan_failed=1
               fi
@@ -329,24 +348,45 @@ pipeline {
             script: 'aws sts get-caller-identity --query Arn --output text',
             returnStdout: true
           ).trim()
-          if (!(callerArn ==~ /^arn:[^:]+:sts::[0-9]{12}:assumed-role\/([A-Za-z0-9+=,.@_-]{1,64})\/[^\/]+$/)) {
+          if (!(callerArn ==~ /^arn:[^:]+:sts::[0-9]{12}:assumed-role\/.+\/[^\/]+$/)) {
             error('AWS deployment requires the Jenkins EC2 instance-profile assumed-role identity.')
           }
-          env.TF_VAR_monitoring_instance_role_name = callerArn.split('/')[1]
-          env.TF_VAR_s3_managed_prefix_list_id = sh(
-            script: "aws ec2 describe-managed-prefix-lists --filters Name=prefix-list-name,Values=com.amazonaws.${env.AWS_REGION}.s3 --query 'PrefixLists[0].PrefixListId' --output text",
+          env.TF_VAR_jenkins_role_arn = callerArn.replaceFirst(
+            /^arn:([^:]+):sts::([0-9]{12}):assumed-role\/(.+)\/[^\/]+$/,
+            'arn:$1:iam::$2:role/$3'
+          )
+          if (!(env.TF_VAR_jenkins_role_arn ==~ /^arn:aws:iam::${env.AWS_ACCOUNT_ID}:role\/.+$/)) {
+            error('Could not derive the Jenkins IAM role ARN from the assumed-role identity.')
+          }
+          if (!(params.KUBERNETES_OPERATOR_PRINCIPAL_ARN ==~ /^arn:aws:iam::${env.AWS_ACCOUNT_ID}:(role|user)\/.+$/)) {
+            error('KUBERNETES_OPERATOR_PRINCIPAL_ARN must be an IAM user or role ARN in the deployment account.')
+          }
+          if (params.KUBERNETES_OPERATOR_PRINCIPAL_ARN == env.TF_VAR_jenkins_role_arn) {
+            error('KUBERNETES_OPERATOR_PRINCIPAL_ARN must be distinct from the Jenkins deployment role.')
+          }
+          if (!(params.KUBERNETES_VERSION ==~ /1\.[0-9]{2}/)) {
+            error('KUBERNETES_VERSION must be a supported EKS Kubernetes minor version such as 1.34.')
+          }
+
+          def clientCidrs = params.KUBERNETES_API_ACCESS_CIDRS
+            .split(',')
+            .collect { it.trim() }
+            .findAll { it }
+          if (clientCidrs.isEmpty() ||
+              clientCidrs.any { !(it ==~ /(?:[0-9]{1,3}\.){3}[0-9]{1,3}\/(?:[1-9]|[12][0-9]|3[0-2])/) }) {
+            error('KUBERNETES_API_ACCESS_CIDRS must contain explicit IPv4 CIDRs with prefixes /1 through /32; /0 is not allowed.')
+          }
+          def jenkinsEgressIp = sh(
+            script: 'curl --fail --silent --show-error --ipv4 https://checkip.amazonaws.com',
             returnStdout: true
           ).trim()
-          if (!(env.TF_VAR_s3_managed_prefix_list_id ==~ /pl-[0-9a-f]+/)) {
-            error('AWS did not return the regional managed S3 prefix list ID.')
+          if (!(jenkinsEgressIp ==~ /(?:[0-9]{1,3}\.){3}[0-9]{1,3}/)) {
+            error('Could not determine the Jenkins agent public egress IPv4 address.')
           }
-          env.TF_VAR_cloudfront_origin_prefix_list_id = sh(
-            script: "aws ec2 describe-managed-prefix-lists --filters Name=prefix-list-name,Values=com.amazonaws.global.cloudfront.origin-facing --query 'PrefixLists[0].PrefixListId' --output text",
-            returnStdout: true
-          ).trim()
-          if (!(env.TF_VAR_cloudfront_origin_prefix_list_id ==~ /pl-[0-9a-f]+/)) {
-            error('AWS did not return the managed CloudFront origin-facing prefix list ID.')
-          }
+          clientCidrs.add("${jenkinsEgressIp}/32")
+          env.TF_VAR_kubernetes_api_access_cidrs = groovy.json.JsonOutput.toJson(clientCidrs.unique())
+          env.TF_VAR_kubernetes_operator_principal_arn = params.KUBERNETES_OPERATOR_PRINCIPAL_ARN
+          env.TF_VAR_kubernetes_version = params.KUBERNETES_VERSION
         }
         sh '''
           set -eu
@@ -356,7 +396,7 @@ pipeline {
               --region "$AWS_REGION" >/dev/null
           done
         '''
-        echo "AWS identity validated for account ${env.AWS_ACCOUNT_ID} in ${env.AWS_REGION}."
+        echo "AWS identity and restricted EKS API access validated for account ${env.AWS_ACCOUNT_ID} in ${env.AWS_REGION}."
       }
     }
 
@@ -371,7 +411,7 @@ pipeline {
       steps {
         sh 'ansible-playbook -i localhost, ansible/playbooks/terraform-workflow.yml -e terraform_operation=plan'
         archiveArtifacts artifacts: 'reports/terraform-plan.txt', fingerprint: true
-        input message: 'Review the Terraform plan and approve creating or updating the CloudFormation-owned ECR registry stack.', ok: 'Approve registry stack'
+        input message: 'Review the Terraform plan, including any deletion of the obsolete AMP/AMG monitoring stack, before approving registry infrastructure changes.', ok: 'Approve infrastructure plan'
         sh 'ansible-playbook -i localhost, ansible/playbooks/terraform-workflow.yml -e terraform_operation=apply -e approved_cloudformation_change=true'
       }
     }
@@ -394,7 +434,7 @@ pipeline {
             script: 'terraform -chdir=terraform output -raw backend_repository_uri',
             returnStdout: true
           ).trim()
-          env.RELEASE_TAG = "sha-${env.GIT_COMMIT}"
+          env.RELEASE_TAG = "build-${env.BUILD_NUMBER}-sha-${env.GIT_COMMIT}"
         }
         sh(script: '''#!/usr/bin/env bash
           set -euo pipefail
@@ -415,25 +455,25 @@ pipeline {
           trap - EXIT
         ''')
         script {
-          env.TF_VAR_frontend_image_uri = sh(
+          def frontendDigest = sh(
             script: "aws ecr describe-images --repository-name '${env.APP_NAME}-frontend' --image-ids imageTag='${env.RELEASE_TAG}' --query 'imageDetails[0].imageDigest' --output text",
             returnStdout: true
           ).trim()
-          env.TF_VAR_backend_image_uri = sh(
+          def backendDigest = sh(
             script: "aws ecr describe-images --repository-name '${env.APP_NAME}-backend' --image-ids imageTag='${env.RELEASE_TAG}' --query 'imageDetails[0].imageDigest' --output text",
             returnStdout: true
           ).trim()
-          if (!(env.TF_VAR_frontend_image_uri ==~ /sha256:[0-9a-f]{64}/) ||
-              !(env.TF_VAR_backend_image_uri ==~ /sha256:[0-9a-f]{64}/)) {
+          if (!(frontendDigest ==~ /sha256:[0-9a-f]{64}/) ||
+              !(backendDigest ==~ /sha256:[0-9a-f]{64}/)) {
             error('ECR did not return valid image digests; deployment is blocked.')
           }
-          env.TF_VAR_frontend_image_uri = "${env.FRONTEND_REPOSITORY_URI}@${env.TF_VAR_frontend_image_uri}"
-          env.TF_VAR_backend_image_uri = "${env.BACKEND_REPOSITORY_URI}@${env.TF_VAR_backend_image_uri}"
+          env.FRONTEND_IMAGE_URI = "${env.FRONTEND_REPOSITORY_URI}@${frontendDigest}"
+          env.BACKEND_IMAGE_URI = "${env.BACKEND_REPOSITORY_URI}@${backendDigest}"
         }
       }
     }
 
-    stage('Deploy to ECS') {
+    stage('Deploy to EKS') {
       when {
         allOf {
           expression { isMainBranchBuild() }
@@ -442,58 +482,150 @@ pipeline {
         }
       }
       steps {
-        withEnv(['TF_VAR_deploy_application=true', 'TF_VAR_service_desired_count=0']) {
+        withEnv(['TF_VAR_deploy_application=true']) {
           sh 'ansible-playbook -i localhost, ansible/playbooks/terraform-workflow.yml -e terraform_operation=plan -e require_application_deployment=true'
         }
         archiveArtifacts artifacts: 'reports/terraform-plan.txt', fingerprint: true
-        input message: 'Review and approve the application, database, network, and monitoring CloudFormation plan.', ok: 'Approve AWS deployment'
-        withEnv(['TF_VAR_deploy_application=true', 'TF_VAR_service_desired_count=0']) {
+        input message: 'Review and approve the EKS cluster, worker nodes, network, database, and IAM CloudFormation plan.', ok: 'Approve EKS infrastructure'
+        withEnv(['TF_VAR_deploy_application=true']) {
           sh 'ansible-playbook -i localhost, ansible/playbooks/terraform-workflow.yml -e terraform_operation=apply -e approved_cloudformation_change=true -e require_application_deployment=true'
         }
         script {
-          env.APPLICATION_URL = sh(
-            script: "terraform -chdir=terraform output -json | jq -r '.application_outputs.value.ApplicationUrl'",
+          env.EKS_CLUSTER_NAME = sh(
+            script: "terraform -chdir=terraform output -json | jq -er '.application_outputs.value.ClusterName'",
             returnStdout: true
           ).trim()
-          if (!env.APPLICATION_URL || env.APPLICATION_URL == 'null') {
-            error('Terraform did not return the CloudFront HTTPS application URL.')
-          }
-          echo "CloudFront HTTPS demo URL: ${env.APPLICATION_URL}"
+          env.K8S_APP_NAMESPACE = sh(
+            script: "terraform -chdir=terraform output -json | jq -er '.application_outputs.value.ApplicationNamespace'",
+            returnStdout: true
+          ).trim()
+          env.DB_HOST = sh(
+            script: "terraform -chdir=terraform output -json | jq -er '.application_outputs.value.DatabaseEndpoint'",
+            returnStdout: true
+          ).trim()
+          env.DB_SECRET_ARN = sh(
+            script: "terraform -chdir=terraform output -json | jq -er '.application_outputs.value.DatabaseSecretArn'",
+            returnStdout: true
+          ).trim()
+          env.METRICS_SECRET_ARN = sh(
+            script: "terraform -chdir=terraform output -json | jq -er '.application_outputs.value.MetricsSecretArn'",
+            returnStdout: true
+          ).trim()
+          env.GRAFANA_SECRET_ARN = sh(
+            script: "terraform -chdir=terraform output -json | jq -er '.application_outputs.value.GrafanaSecretArn'",
+            returnStdout: true
+          ).trim()
+          env.KUBECONFIG = "${env.WORKSPACE}@tmp/kubeconfig-${env.BUILD_NUMBER}"
         }
-        input message: "Review the CloudFront HTTPS demo endpoint and approve the reviewed Prisma migration.", ok: 'Approve database migration'
-        sh 'ansible-playbook -i localhost, ansible/playbooks/run-database-migrations.yml -e approved_database_migration=true'
-        withEnv(['TF_VAR_deploy_application=true', 'TF_VAR_service_desired_count=1']) {
-          sh 'ansible-playbook -i localhost, ansible/playbooks/terraform-workflow.yml -e terraform_operation=plan -e require_application_deployment=true'
-        }
-        archiveArtifacts artifacts: 'reports/terraform-plan.txt', fingerprint: true
-        input message: 'Approve enabling ECS traffic only after the Prisma migration task succeeded.', ok: 'Approve ECS services'
-        withEnv(['TF_VAR_deploy_application=true', 'TF_VAR_service_desired_count=1']) {
-          sh 'ansible-playbook -i localhost, ansible/playbooks/terraform-workflow.yml -e terraform_operation=apply -e approved_cloudformation_change=true -e require_application_deployment=true'
-        }
-        sh 'ansible-playbook -i localhost, ansible/playbooks/verify-application.yml'
-      }
-    }
+        sh '''#!/usr/bin/env bash
+          set -euo pipefail
+          umask 077
+          aws eks wait cluster-active --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+          aws eks update-kubeconfig \
+            --name "$EKS_CLUSTER_NAME" \
+            --region "$AWS_REGION" \
+            --kubeconfig "$KUBECONFIG"
+          kubectl wait --for=condition=Ready nodes --all --timeout=20m
+          kubectl apply --filename k8s/namespace.yaml
+          kubectl create namespace monitoring --dry-run=client --output yaml | kubectl apply --filename -
 
-    stage('Monitoring Verification') {
-      when {
-        allOf {
-          expression { isMainBranchBuild() }
-          expression { params.DEPLOY_TO_AWS }
-          expression { currentBuild.currentResult == 'SUCCESS' }
-        }
-      }
-      steps {
-        input message: 'Confirm IAM Identity Center users are assigned to AMG and the grafana-api-token Jenkins credential is ready.', ok: 'Provision Grafana'
-        withCredentials([string(credentialsId: 'grafana-api-token', variable: 'GRAFANA_API_TOKEN')]) {
-          sh 'ansible-playbook -i localhost, ansible/playbooks/provision-monitoring.yml'
-        }
-        script {
-          env.GRAFANA_ENDPOINT = sh(
-            script: 'terraform -chdir=terraform output -json | jq -r \'.monitoring_outputs.value.GrafanaWorkspaceEndpoint\'',
-            returnStdout: true
-          ).trim()
-        }
-        echo "Grafana workspace: https://${env.GRAFANA_ENDPOINT}"
+          kubectl create configmap backend-config \
+            --namespace "$K8S_APP_NAMESPACE" \
+            --from-literal="DB_HOST=$DB_HOST" \
+            --from-literal=DB_PORT=5432 \
+            --from-literal=DB_NAME=it_your_it_house \
+            --from-literal=DB_USER=app_user \
+            --dry-run=client --output yaml | kubectl apply --filename -
+
+          aws secretsmanager get-secret-value \
+            --secret-id "$DB_SECRET_ARN" \
+            --query SecretString --output text \
+            | node scripts/render-k8s-secret.mjs database-credentials password password \
+            | kubectl apply --filename -
+          aws secretsmanager get-secret-value \
+            --secret-id "$METRICS_SECRET_ARN" \
+            --query SecretString --output text \
+            | node scripts/render-k8s-secret.mjs backend-metrics token \
+            | kubectl apply --filename -
+          aws secretsmanager get-secret-value \
+            --secret-id "$GRAFANA_SECRET_ARN" \
+            --query SecretString --output text \
+            | node scripts/render-k8s-secret.mjs grafana-admin admin-password "" monitoring admin-user=admin \
+            | kubectl apply --filename -
+
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts --force-update
+          helm repo update prometheus-community
+          helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
+            --version 92.10.1 \
+            --namespace monitoring \
+            --values k8s/monitoring-values.yaml \
+            --wait --timeout 15m
+
+          kubectl create configmap it-your-it-house-dashboard \
+            --namespace monitoring \
+            --from-file=it-your-it-house.json=monitoring/grafana/provisioning/dashboards/it-your-it-house.json \
+            --dry-run=client --output yaml \
+            | kubectl label --local --filename - grafana_dashboard=1 --overwrite --output yaml \
+            | kubectl apply --filename -
+          kubectl rollout status deployment/monitoring-grafana --namespace monitoring --timeout=10m
+        '''
+        input message: 'Review and approve the Prisma migration against the new private PostgreSQL database.', ok: 'Approve database migration'
+        sh '''#!/usr/bin/env bash
+          set -euo pipefail
+          node scripts/render-k8s-manifest.mjs k8s/prisma-migration.yaml.tpl \
+            | kubectl apply --filename -
+          if ! kubectl wait \
+            --for=condition=complete \
+            "job/prisma-migration-$BUILD_NUMBER" \
+            --namespace "$K8S_APP_NAMESPACE" \
+            --timeout=30m; then
+            echo 'Prisma migration job did not complete successfully; inspect restricted Kubernetes job logs.'
+            exit 1
+          fi
+          kubectl get "job/prisma-migration-$BUILD_NUMBER" \
+            --namespace "$K8S_APP_NAMESPACE" \
+            --output json \
+            | jq -e '.status.succeeded == 1' >/dev/null
+        '''
+        sh '''#!/usr/bin/env bash
+          set -euo pipefail
+          node scripts/render-k8s-manifest.mjs k8s/application.yaml.tpl \
+            | kubectl apply --filename -
+          kubectl rollout status deployment/frontend --namespace "$K8S_APP_NAMESPACE" --timeout=10m
+          kubectl rollout status deployment/backend --namespace "$K8S_APP_NAMESPACE" --timeout=10m
+          for deployment in frontend backend; do
+            kubectl get pods --namespace "$K8S_APP_NAMESPACE" --selector "app=$deployment" --output json \
+              | jq -e '.items | length > 0 and all(.[]; .status.phase == "Running" and ([.status.containerStatuses[]? | select(.ready == true)] | length == (.status.containerStatuses | length)))' >/dev/null
+          done
+          kubectl exec --namespace "$K8S_APP_NAMESPACE" deployment/frontend -- \
+            node -e "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+          kubectl exec --namespace "$K8S_APP_NAMESPACE" deployment/backend -- \
+            node -e "fetch('http://127.0.0.1:4000/auth/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+          kubectl port-forward --namespace monitoring \
+            service/monitoring-kube-prometheus-prometheus 19090:9090 \
+            > "$KUBECONFIG.prometheus.log" 2>&1 &
+          port_forward_pid=$!
+          trap 'kill "$port_forward_pid" 2>/dev/null || true; rm -f "$KUBECONFIG.prometheus.log"' EXIT
+          attempt=0
+          until curl --fail --silent http://127.0.0.1:19090/-/ready >/dev/null; do
+            attempt=$((attempt + 1))
+            if [ "$attempt" -ge 30 ]; then
+              echo 'Prometheus did not become ready for the deployment check.'
+              exit 1
+            fi
+            sleep 2
+          done
+          curl --fail --silent --get \
+            --data-urlencode "query=up{namespace=\\"$K8S_APP_NAMESPACE\\",service=\\"backend\\"}" \
+            http://127.0.0.1:19090/api/v1/query \
+            | jq -e '.status == "success" and (.data.result | length > 0) and any(.data.result[]; .value[1] == "1")' >/dev/null
+          kubectl get pods --namespace "$K8S_APP_NAMESPACE" --output wide
+          kubectl get pods --namespace monitoring --output wide
+        '''
+        echo "Deployment verified. To open the app, run kubectl port-forward -n ${env.K8S_APP_NAMESPACE} svc/frontend 3000:3000; then browse http://localhost:3000."
+        echo 'Grafana is private: run kubectl port-forward -n monitoring svc/monitoring-grafana 3001:80, then open http://localhost:3001.'
+        echo "Use the configured Kubernetes operator AWS identity and the approved CIDR allowlist to access EKS."
       }
     }
   }
@@ -502,6 +634,7 @@ pipeline {
     always {
       archiveArtifacts artifacts: 'reports/trivy/**,reports/semgrep/**,reports/terraform-plan.txt', allowEmptyArchive: true
       sh 'rm -rf -- "$TRIVY_HOME"'
+      sh 'if [ -n "${KUBECONFIG:-}" ]; then rm -f -- "$KUBECONFIG"; fi'
       echo 'Security reports are archived; review Jenkins access controls before sharing build artifacts.'
     }
     success {

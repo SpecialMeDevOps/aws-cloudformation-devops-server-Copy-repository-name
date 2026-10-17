@@ -22,33 +22,51 @@ variable "deploy_application" {
   default     = false
 }
 
-variable "frontend_image_uri" {
-  description = "Frontend ECR image URI using an immutable commit tag."
+variable "kubernetes_version" {
+  description = "Supported Amazon EKS Kubernetes minor version."
   type        = string
-  default     = ""
+  default     = "1.34"
   validation {
-    condition     = !var.deploy_application || can(regex(".+@sha256:[a-f0-9]{64}", var.frontend_image_uri))
-    error_message = "Application deployment requires a frontend ECR image URI pinned to a SHA256 digest."
+    condition     = can(regex("^1\\.[0-9]{2}$", var.kubernetes_version))
+    error_message = "kubernetes_version must be an EKS Kubernetes minor version such as 1.34."
   }
 }
 
-variable "backend_image_uri" {
-  description = "Backend ECR image URI using an immutable commit tag."
-  type        = string
-  default     = ""
+variable "kubernetes_api_access_cidrs" {
+  description = "Explicit IPv4 CIDRs allowed to connect to the EKS public API endpoint."
+  type        = list(string)
+  default     = []
   validation {
-    condition     = !var.deploy_application || can(regex(".+@sha256:[a-f0-9]{64}", var.backend_image_uri))
-    error_message = "Application deployment requires a backend ECR image URI pinned to a SHA256 digest."
+    condition = !var.deploy_application || (
+      length(var.kubernetes_api_access_cidrs) > 0 &&
+      alltrue([
+        for cidr in var.kubernetes_api_access_cidrs :
+        can(cidrhost(cidr, 0)) &&
+        can(regex("^([0-9]{1,3}\\.){3}[0-9]{1,3}/([1-9]|[12][0-9]|3[0-2])$", cidr)) &&
+        can(cidrhost(cidr, 0) == split("/", cidr)[0])
+      ])
+    )
+    error_message = "Application deployment requires canonical, explicitly scoped IPv4 CIDRs for EKS API access; /0 is not allowed."
   }
 }
 
-variable "cloudfront_origin_prefix_list_id" {
-  description = "AWS-managed CloudFront origin-facing prefix list ID used to restrict private ALB ingress."
+variable "jenkins_role_arn" {
+  description = "IAM role ARN used by Jenkins to deploy to the EKS cluster."
   type        = string
   default     = ""
   validation {
-    condition     = !var.deploy_application || can(regex("^pl-[0-9a-f]+$", var.cloudfront_origin_prefix_list_id))
-    error_message = "Application deployment requires the AWS-managed CloudFront origin-facing prefix list ID for the selected region."
+    condition     = !var.deploy_application || can(regex("^arn:aws:iam::[0-9]{12}:role/.+$", var.jenkins_role_arn))
+    error_message = "Application deployment requires the Jenkins EC2 instance-profile IAM role ARN."
+  }
+}
+
+variable "kubernetes_operator_principal_arn" {
+  description = "IAM user or role ARN authorized to port-forward and inspect the demo namespace."
+  type        = string
+  default     = ""
+  validation {
+    condition     = !var.deploy_application || can(regex("^arn:aws:iam::[0-9]{12}:(role|user)/.+$", var.kubernetes_operator_principal_arn))
+    error_message = "Application deployment requires an IAM user or role ARN for the Kubernetes operator."
   }
 }
 
@@ -56,34 +74,4 @@ variable "db_instance_class" {
   description = "RDS PostgreSQL instance class; review cost and availability before applying."
   type        = string
   default     = "db.t4g.micro"
-}
-
-variable "service_desired_count" {
-  description = "Desired count for ECS services; deployment workflow sets zero until the approved Prisma migration completes."
-  type        = number
-  default     = 1
-  validation {
-    condition     = var.service_desired_count >= 0 && var.service_desired_count <= 2
-    error_message = "service_desired_count must be between 0 and 2."
-  }
-}
-
-variable "s3_managed_prefix_list_id" {
-  description = "AWS-managed regional S3 prefix list ID used to restrict ECR layer download egress."
-  type        = string
-  default     = ""
-  validation {
-    condition     = !var.deploy_application || can(regex("^pl-[0-9a-f]+$", var.s3_managed_prefix_list_id))
-    error_message = "Application deployment requires the AWS-managed S3 prefix list ID for the selected region."
-  }
-}
-
-variable "monitoring_instance_role_name" {
-  description = "Optional existing Jenkins EC2 role to receive scoped read-only ECS/CloudWatch monitoring permissions."
-  type        = string
-  default     = ""
-  validation {
-    condition     = !var.deploy_application || length(trimspace(var.monitoring_instance_role_name)) > 0
-    error_message = "Application deployment requires the existing Jenkins instance-profile role name for monitoring verification."
-  }
 }

@@ -1,43 +1,31 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: Private ECS Fargate application, CloudFront VPC origin, and encrypted PostgreSQL database.
+Description: Private PostgreSQL and a restricted-access EKS cluster for the application and in-cluster monitoring.
 
 Parameters:
   ProjectName:
     Type: String
     Default: it-your-it-house
+    AllowedPattern: "[a-zA-Z0-9][a-zA-Z0-9._-]*"
   Environment:
     Type: String
     Default: dev
-  FrontendImageUri:
+    AllowedPattern: "[a-zA-Z0-9][a-zA-Z0-9._-]*"
+  KubernetesVersion:
     Type: String
-    AllowedPattern: ".+@sha256:[a-f0-9]{64}"
-    Description: Image digest already pushed to ECR and approved by Trivy.
-  BackendImageUri:
+    Default: "1.34"
+    AllowedPattern: "1\\.[0-9]{2}"
+  KubernetesApiAccessCidrs:
+    Type: CommaDelimitedList
+    Description: Explicit client CIDRs for the IAM-authenticated EKS public API endpoint. Do not include 0.0.0.0/0.
+  JenkinsRoleArn:
     Type: String
-    AllowedPattern: ".+@sha256:[a-f0-9]{64}"
-    Description: Image digest already pushed to ECR and approved by Trivy.
-  AmpRemoteWriteEndpoint:
+    AllowedPattern: "^arn:aws:iam::[0-9]{12}:role/.+$"
+  OperatorPrincipalArn:
     Type: String
-    Description: Remote-write endpoint from the monitoring CloudFormation stack.
-  AmpWorkspaceArn:
-    Type: String
-    Description: Workspace ARN used to scope the ECS task remote-write permission.
-  S3ManagedPrefixListId:
-    Type: String
-    AllowedPattern: "pl-[0-9a-f]+"
-    Description: Region-specific AWS-managed S3 prefix list ID for ECR image layer downloads.
-  CloudFrontOriginPrefixListId:
-    Type: String
-    AllowedPattern: "pl-[0-9a-f]+"
-    Description: AWS-managed CloudFront origin-facing prefix list ID for this region.
+    AllowedPattern: "^arn:aws:iam::[0-9]{12}:(role|user)/.+$"
   DbInstanceClass:
     Type: String
     Default: db.t4g.micro
-  ServiceDesiredCount:
-    Type: Number
-    Default: 1
-    MinValue: 0
-    MaxValue: 2
   DbAllocatedStorage:
     Type: Number
     Default: 20
@@ -74,10 +62,10 @@ Resources:
       VpcId: !Ref Vpc
       AvailabilityZone: !Select [0, !GetAZs ""]
       CidrBlock: 10.42.0.0/24
-      MapPublicIpOnLaunch: false
+      MapPublicIpOnLaunch: true
       Tags:
         - Key: Name
-          Value: !Sub "${ProjectName}-${Environment}-public-a"
+          Value: !Sub "${ProjectName}-${Environment}-eks-public-a"
 
   PublicSubnetB:
     Type: AWS::EC2::Subnet
@@ -85,10 +73,10 @@ Resources:
       VpcId: !Ref Vpc
       AvailabilityZone: !Select [1, !GetAZs ""]
       CidrBlock: 10.42.1.0/24
-      MapPublicIpOnLaunch: false
+      MapPublicIpOnLaunch: true
       Tags:
         - Key: Name
-          Value: !Sub "${ProjectName}-${Environment}-public-b"
+          Value: !Sub "${ProjectName}-${Environment}-eks-public-b"
 
   PrivateSubnetA:
     Type: AWS::EC2::Subnet
@@ -99,7 +87,7 @@ Resources:
       MapPublicIpOnLaunch: false
       Tags:
         - Key: Name
-          Value: !Sub "${ProjectName}-${Environment}-private-a"
+          Value: !Sub "${ProjectName}-${Environment}-database-a"
 
   PrivateSubnetB:
     Type: AWS::EC2::Subnet
@@ -110,15 +98,12 @@ Resources:
       MapPublicIpOnLaunch: false
       Tags:
         - Key: Name
-          Value: !Sub "${ProjectName}-${Environment}-private-b"
+          Value: !Sub "${ProjectName}-${Environment}-database-b"
 
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref Vpc
-      Tags:
-        - Key: Name
-          Value: !Sub "${ProjectName}-${Environment}-public"
 
   PublicDefaultRoute:
     Type: AWS::EC2::Route
@@ -140,210 +125,16 @@ Resources:
       SubnetId: !Ref PublicSubnetB
       RouteTableId: !Ref PublicRouteTable
 
-  PrivateRouteTable:
-    Type: AWS::EC2::RouteTable
-    Properties:
-      VpcId: !Ref Vpc
-      Tags:
-        - Key: Name
-          Value: !Sub "${ProjectName}-${Environment}-private"
-
-  PrivateSubnetARoute:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref PrivateSubnetA
-      RouteTableId: !Ref PrivateRouteTable
-
-  PrivateSubnetBRoute:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref PrivateSubnetB
-      RouteTableId: !Ref PrivateRouteTable
-
-  LoadBalancerSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Allow CloudFront origin-facing traffic to the private application load balancer.
-      VpcId: !Ref Vpc
-      SecurityGroupEgress:
-        - IpProtocol: tcp
-          FromPort: 3000
-          ToPort: 3000
-          CidrIp: 10.42.10.0/23
-        - IpProtocol: tcp
-          FromPort: 4000
-          ToPort: 4000
-          CidrIp: 10.42.10.0/23
-      SecurityGroupIngress:
-        - Description: Allow only CloudFront origin-facing traffic to the private origin.
-          IpProtocol: tcp
-          FromPort: 80
-          ToPort: 80
-          SourcePrefixListId: !Ref CloudFrontOriginPrefixListId
-  FrontendSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Allow load balancer ingress to frontend tasks.
-      VpcId: !Ref Vpc
-      SecurityGroupEgress:
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          DestinationSecurityGroupId: !Ref VpcEndpointsSecurityGroup
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          DestinationPrefixListId: !Ref S3ManagedPrefixListId
-        - IpProtocol: tcp
-          FromPort: 4000
-          ToPort: 4000
-          CidrIp: 10.42.10.0/23
-        - IpProtocol: udp
-          FromPort: 53
-          ToPort: 53
-          CidrIp: 10.42.0.2/32
-        - IpProtocol: tcp
-          FromPort: 53
-          ToPort: 53
-          CidrIp: 10.42.0.2/32
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 3000
-          ToPort: 3000
-          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
-
-  BackendSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Allow load balancer and frontend ingress to backend tasks.
-      VpcId: !Ref Vpc
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 4000
-          ToPort: 4000
-          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
-        - IpProtocol: tcp
-          FromPort: 4000
-          ToPort: 4000
-          SourceSecurityGroupId: !Ref FrontendSecurityGroup
-      SecurityGroupEgress:
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          DestinationSecurityGroupId: !Ref VpcEndpointsSecurityGroup
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          DestinationPrefixListId: !Ref S3ManagedPrefixListId
-        - IpProtocol: tcp
-          FromPort: 5432
-          ToPort: 5432
-          CidrIp: 10.42.10.0/23
-        - IpProtocol: udp
-          FromPort: 53
-          ToPort: 53
-          CidrIp: 10.42.0.2/32
-        - IpProtocol: tcp
-          FromPort: 53
-          ToPort: 53
-          CidrIp: 10.42.0.2/32
-
-  VpcEndpointsSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Allow private ECS tasks to reach only required AWS interface endpoints.
-      VpcId: !Ref Vpc
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: 10.42.0.0/16
-      SecurityGroupEgress: []
-
-  EcrApiEndpoint:
-    Type: AWS::EC2::VPCEndpoint
-    Properties:
-      VpcEndpointType: Interface
-      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.api"
-      VpcId: !Ref Vpc
-      PrivateDnsEnabled: true
-      SubnetIds:
-        - !Ref PrivateSubnetA
-        - !Ref PrivateSubnetB
-      SecurityGroupIds:
-        - !Ref VpcEndpointsSecurityGroup
-
-  EcrDockerEndpoint:
-    Type: AWS::EC2::VPCEndpoint
-    Properties:
-      VpcEndpointType: Interface
-      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.dkr"
-      VpcId: !Ref Vpc
-      PrivateDnsEnabled: true
-      SubnetIds:
-        - !Ref PrivateSubnetA
-        - !Ref PrivateSubnetB
-      SecurityGroupIds:
-        - !Ref VpcEndpointsSecurityGroup
-
-  CloudWatchLogsEndpoint:
-    Type: AWS::EC2::VPCEndpoint
-    Properties:
-      VpcEndpointType: Interface
-      ServiceName: !Sub "com.amazonaws.${AWS::Region}.logs"
-      VpcId: !Ref Vpc
-      PrivateDnsEnabled: true
-      SubnetIds:
-        - !Ref PrivateSubnetA
-        - !Ref PrivateSubnetB
-      SecurityGroupIds:
-        - !Ref VpcEndpointsSecurityGroup
-
-  SecretsManagerEndpoint:
-    Type: AWS::EC2::VPCEndpoint
-    Properties:
-      VpcEndpointType: Interface
-      ServiceName: !Sub "com.amazonaws.${AWS::Region}.secretsmanager"
-      VpcId: !Ref Vpc
-      PrivateDnsEnabled: true
-      SubnetIds:
-        - !Ref PrivateSubnetA
-        - !Ref PrivateSubnetB
-      SecurityGroupIds:
-        - !Ref VpcEndpointsSecurityGroup
-
-  AmpWorkspacesVpcEndpoint:
-    Type: AWS::EC2::VPCEndpoint
-    Properties:
-      VpcEndpointType: Interface
-      ServiceName: !Sub "com.amazonaws.${AWS::Region}.aps-workspaces"
-      VpcId: !Ref Vpc
-      PrivateDnsEnabled: true
-      SubnetIds:
-        - !Ref PrivateSubnetA
-        - !Ref PrivateSubnetB
-      SecurityGroupIds:
-        - !Ref VpcEndpointsSecurityGroup
-
-  S3GatewayEndpoint:
-    Type: AWS::EC2::VPCEndpoint
-    Properties:
-      VpcEndpointType: Gateway
-      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
-      VpcId: !Ref Vpc
-      RouteTableIds:
-        - !Ref PrivateRouteTable
-
   DatabaseSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: PostgreSQL access from the backend task only.
+      GroupDescription: PostgreSQL is reachable only from EKS cluster and node security groups.
       VpcId: !Ref Vpc
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 5432
           ToPort: 5432
-          SourceSecurityGroupId: !Ref BackendSecurityGroup
+          SourceSecurityGroupId: !GetAtt EksCluster.ClusterSecurityGroupId
       SecurityGroupEgress: []
 
   DatabaseSubnetGroup:
@@ -365,6 +156,30 @@ Resources:
       GenerateSecretString:
         SecretStringTemplate: '{"username":"app_user"}'
         GenerateStringKey: password
+        PasswordLength: 40
+        ExcludePunctuation: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  MetricsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}/${Environment}/metrics-token"
+      Description: Backend metrics bearer token.
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  GrafanaSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}/${Environment}/grafana-admin"
+      Description: Generated password for the private demo Grafana dashboard.
+      GenerateSecretString:
         PasswordLength: 40
         ExcludePunctuation: true
       Tags:
@@ -401,39 +216,7 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
-  MetricsSecret:
-    Type: AWS::SecretsManager::Secret
-    Properties:
-      Name: !Sub "${ProjectName}/${Environment}/metrics-token"
-      Description: Backend metrics bearer token.
-      GenerateSecretString:
-        PasswordLength: 48
-        ExcludePunctuation: true
-
-  EcsCluster:
-    Type: AWS::ECS::Cluster
-    Properties:
-      ClusterName: !Sub "${ProjectName}-${Environment}-cluster"
-      ClusterSettings:
-        - Name: containerInsights
-          Value: enabled
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
-
-  BackendLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub "/ecs/${ProjectName}/${Environment}/backend"
-      RetentionInDays: 30
-
-  FrontendLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub "/ecs/${ProjectName}/${Environment}/frontend"
-      RetentionInDays: 30
-
-  TaskExecutionRole:
+  EksClusterRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -441,22 +224,15 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Service: ecs-tasks.amazonaws.com
+              Service: eks.amazonaws.com
             Action: sts:AssumeRole
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
-      Policies:
-        - PolicyName: ReadApplicationSecrets
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action: secretsmanager:GetSecretValue
-                Resource:
-                  - !Ref DatabaseSecret
-                  - !Ref MetricsSecret
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
 
-  ApplicationTaskRole:
+  EksNodeRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -464,464 +240,128 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Service: ecs-tasks.amazonaws.com
+              Service: ec2.amazonaws.com
             Action: sts:AssumeRole
-      Policies:
-        - PolicyName: WriteApplicationMetrics
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action:
-                  - aps:RemoteWrite
-                Resource: !Ref AmpWorkspaceArn
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
 
-  BackendTaskDefinition:
-    Type: AWS::ECS::TaskDefinition
+  EksCluster:
+    Type: AWS::EKS::Cluster
     Properties:
-      Family: !Sub "${ProjectName}-${Environment}-backend"
-      Cpu: "512"
-      Memory: "1024"
-      NetworkMode: awsvpc
-      RequiresCompatibilities:
-        - FARGATE
-      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
-      TaskRoleArn: !GetAtt ApplicationTaskRole.Arn
-      ContainerDefinitions:
-        - Name: backend
-          Image: !Ref BackendImageUri
-          Essential: true
-          PortMappings:
-            - ContainerPort: 4000
-              Protocol: tcp
-          Environment:
-            - Name: NODE_ENV
-              Value: production
-            - Name: APP_PORT
-              Value: "4000"
-            - Name: DB_HOST
-              Value: !GetAtt Database.Endpoint.Address
-            - Name: DB_PORT
-              Value: "5432"
-            - Name: DB_NAME
-              Value: it_your_it_house
-            - Name: DB_USER
-              Value: app_user
-          Secrets:
-            - Name: DB_PASSWORD
-              ValueFrom: !Sub "${DatabaseSecret}:password::"
-            - Name: METRICS_TOKEN
-              ValueFrom: !Ref MetricsSecret
-          HealthCheck:
-            Command:
-              - CMD-SHELL
-              - node -e "fetch('http://127.0.0.1:4000/auth/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
-            Interval: 30
-            Timeout: 5
-            Retries: 3
-            StartPeriod: 90
-          LogConfiguration:
-            LogDriver: awslogs
-            Options:
-              awslogs-group: !Ref BackendLogGroup
-              awslogs-region: !Ref AWS::Region
-              awslogs-stream-prefix: backend
-        - Name: adot-collector
-          Image: public.ecr.aws/aws-observability/aws-otel-collector:v0.43.3
-          Essential: false
-          Command:
-            - --config=env:OTEL_CONFIG
-          Environment:
-            - Name: AWS_REGION
-              Value: !Ref AWS::Region
-            - Name: AMP_REMOTE_WRITE_ENDPOINT
-              Value: !Ref AmpRemoteWriteEndpoint
-            - Name: OTEL_CONFIG
-              Value: !Sub |
-                extensions:
-                  sigv4auth:
-                    region: ${AWS::Region}
-                    service: aps
-                receivers:
-                  prometheus:
-                    config:
-                      scrape_configs:
-                        - job_name: it-your-it-house-backend
-                          scrape_interval: 15s
-                          metrics_path: /metrics
-                          authorization:
-                            type: Bearer
-                            credentials: ${!env:METRICS_TOKEN}
-                          static_configs:
-                            - targets: ["localhost:4000"]
-                processors:
-                  batch:
-                    timeout: 5s
-                exporters:
-                  prometheusremotewrite:
-                    endpoint: ${AmpRemoteWriteEndpoint}
-                    auth:
-                      authenticator: sigv4auth
-                service:
-                  extensions: [sigv4auth]
-                  pipelines:
-                    metrics:
-                      receivers: [prometheus]
-                      processors: [batch]
-                      exporters: [prometheusremotewrite]
-          Secrets:
-            - Name: METRICS_TOKEN
-              ValueFrom: !Ref MetricsSecret
-          LogConfiguration:
-            LogDriver: awslogs
-            Options:
-              awslogs-group: !Ref BackendLogGroup
-              awslogs-region: !Ref AWS::Region
-              awslogs-stream-prefix: adot
+      Name: !Sub "${ProjectName}-${Environment}-cluster"
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt EksClusterRole.Arn
+      AccessConfig:
+        AuthenticationMode: API
+        BootstrapClusterCreatorAdminPermissions: false
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+          - !Ref PublicSubnetA
+          - !Ref PublicSubnetB
+        EndpointPrivateAccess: true
+        EndpointPublicAccess: true
+        PublicAccessCidrs: !Ref KubernetesApiAccessCidrs
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
 
-  FrontendTaskDefinition:
-    Type: AWS::ECS::TaskDefinition
+  JenkinsClusterAccess:
+    Type: AWS::EKS::AccessEntry
     Properties:
-      Family: !Sub "${ProjectName}-${Environment}-frontend"
-      Cpu: "256"
-      Memory: "512"
-      NetworkMode: awsvpc
-      RequiresCompatibilities:
-        - FARGATE
-      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
-      ContainerDefinitions:
-        - Name: frontend
-          Image: !Ref FrontendImageUri
-          Essential: true
-          PortMappings:
-            - ContainerPort: 3000
-              Protocol: tcp
-          Environment:
-            - Name: NODE_ENV
-              Value: production
-            - Name: PORT
-              Value: "3000"
-            - Name: BACKEND_URL
-              Value: !Sub "http://backend.${ProjectName}-${Environment}.local:4000"
-          HealthCheck:
-            Command:
-              - CMD-SHELL
-              - node -e "fetch('http://127.0.0.1:3000/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
-            Interval: 30
-            Timeout: 5
-            Retries: 3
-            StartPeriod: 60
-          LogConfiguration:
-            LogDriver: awslogs
-            Options:
-              awslogs-group: !Ref FrontendLogGroup
-              awslogs-region: !Ref AWS::Region
-              awslogs-stream-prefix: frontend
+      ClusterName: !Ref EksCluster
+      PrincipalArn: !Ref JenkinsRoleArn
+      Type: STANDARD
+      AccessPolicies:
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope:
+            Type: cluster
 
-  LoadBalancer:
-    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+  OperatorClusterAccess:
+    Type: AWS::EKS::AccessEntry
     Properties:
-      Type: application
-      Scheme: internal
-      IpAddressType: ipv4
-      SecurityGroups:
-        - !Ref LoadBalancerSecurityGroup
+      ClusterName: !Ref EksCluster
+      PrincipalArn: !Ref OperatorPrincipalArn
+      Type: STANDARD
+      AccessPolicies:
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy
+          AccessScope:
+            Type: namespace
+            Namespaces:
+              - !Sub "${ProjectName}-${Environment}"
+              - monitoring
+
+  VpcCniAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      AddonName: vpc-cni
+      ClusterName: !Ref EksCluster
+      ResolveConflicts: OVERWRITE
+
+  CoreDnsAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      AddonName: coredns
+      ClusterName: !Ref EksCluster
+      ResolveConflicts: OVERWRITE
+
+  KubeProxyAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      AddonName: kube-proxy
+      ClusterName: !Ref EksCluster
+      ResolveConflicts: OVERWRITE
+
+  EksNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    DependsOn:
+      - VpcCniAddon
+      - CoreDnsAddon
+      - KubeProxyAddon
+    Properties:
+      ClusterName: !Ref EksCluster
+      NodegroupName: !Sub "${ProjectName}-${Environment}-nodes"
+      NodeRole: !GetAtt EksNodeRole.Arn
       Subnets:
-        - !Ref PrivateSubnetA
-        - !Ref PrivateSubnetB
-      LoadBalancerAttributes:
-        - Key: deletion_protection.enabled
-          Value: "true"
-        - Key: routing.http.drop_invalid_header_fields.enabled
-          Value: "true"
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      AmiType: AL2023_x86_64_STANDARD
+      CapacityType: ON_DEMAND
+      InstanceTypes:
+        - t3.medium
+      DiskSize: 30
+      ScalingConfig:
+        MinSize: 1
+        MaxSize: 2
+        DesiredSize: 2
+      UpdateConfig:
+        MaxUnavailable: 1
       Tags:
-        - Key: Project
-          Value: !Ref ProjectName
-
-  FrontendTargetGroup:
-    Type: AWS::ElasticLoadBalancingV2::TargetGroup
-    Properties:
-      VpcId: !Ref Vpc
-      TargetType: ip
-      Port: 3000
-      Protocol: HTTP
-      HealthCheckPath: /api/health
-      Matcher:
-        HttpCode: "200"
-      HealthyThresholdCount: 2
-      UnhealthyThresholdCount: 3
-      HealthCheckIntervalSeconds: 30
-
-  BackendTargetGroup:
-    Type: AWS::ElasticLoadBalancingV2::TargetGroup
-    Properties:
-      VpcId: !Ref Vpc
-      TargetType: ip
-      Port: 4000
-      Protocol: HTTP
-      HealthCheckPath: /auth/health
-      Matcher:
-        HttpCode: "200"
-      HealthyThresholdCount: 2
-      UnhealthyThresholdCount: 3
-      HealthCheckIntervalSeconds: 30
-
-  HttpListener:
-    Type: AWS::ElasticLoadBalancingV2::Listener
-    Properties:
-      LoadBalancerArn: !Ref LoadBalancer
-      Port: 80
-      Protocol: HTTP
-      DefaultActions:
-        - Type: forward
-          TargetGroupArn: !Ref FrontendTargetGroup
-
-  HttpBackendApiListenerRule:
-    Type: AWS::ElasticLoadBalancingV2::ListenerRule
-    DependsOn:
-      - HttpListener
-    Properties:
-      ListenerArn: !Ref HttpListener
-      Priority: 10
-      Conditions:
-        - Field: path-pattern
-          Values:
-            - /auth/*
-            - /projects*
-            - /api/docs*
-      Actions:
-        - Type: forward
-          TargetGroupArn: !Ref BackendTargetGroup
-
-  CloudFrontVpcOrigin:
-    Type: AWS::CloudFront::VpcOrigin
-    DependsOn:
-      - LoadBalancer
-    Properties:
-      VpcOriginEndpointConfig:
-        Arn: !Ref LoadBalancer
-        HTTPPort: 80
-        Name: !Sub "${ProjectName}-${Environment}-alb-origin"
-        OriginProtocolPolicy: http-only
-        IpAddressType: ipv4
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
-        - Key: Environment
-          Value: !Ref Environment
-
-  ApplicationNoCachePolicy:
-    Type: AWS::CloudFront::CachePolicy
-    Properties:
-      CachePolicyConfig:
-        Name: !Sub "${ProjectName}-${Environment}-no-cache"
-        MinTTL: 0
-        DefaultTTL: 0
-        MaxTTL: 0
-        ParametersInCacheKeyAndForwardedToOrigin:
-          EnableAcceptEncodingGzip: true
-          EnableAcceptEncodingBrotli: true
-          CookiesConfig:
-            CookieBehavior: none
-          HeadersConfig:
-            HeaderBehavior: none
-          QueryStringsConfig:
-            QueryStringBehavior: none
-
-  ApplicationOriginRequestPolicy:
-    Type: AWS::CloudFront::OriginRequestPolicy
-    Properties:
-      OriginRequestPolicyConfig:
-        Name: !Sub "${ProjectName}-${Environment}-all-viewer-requests"
-        CookiesConfig:
-          CookieBehavior: all
-        HeadersConfig:
-          HeaderBehavior: allViewer
-        QueryStringsConfig:
-          QueryStringBehavior: all
-
-  ApplicationDistribution:
-    Type: AWS::CloudFront::Distribution
-    Properties:
-      DistributionConfig:
-        Enabled: true
-        Comment: !Sub "${ProjectName}-${Environment} temporary demo"
-        HttpVersion: http2
-        IPV6Enabled: true
-        PriceClass: PriceClass_100
-        Origins:
-          - DomainName: !GetAtt LoadBalancer.DNSName
-            Id: application-private-alb
-            VpcOriginConfig:
-              VpcOriginId: !Ref CloudFrontVpcOrigin
-              OriginReadTimeout: 30
-              OriginKeepaliveTimeout: 5
-        DefaultCacheBehavior:
-          TargetOriginId: application-private-alb
-          ViewerProtocolPolicy: redirect-to-https
-          AllowedMethods:
-            - GET
-            - HEAD
-            - OPTIONS
-            - PUT
-            - POST
-            - PATCH
-            - DELETE
-          CachedMethods:
-            - GET
-            - HEAD
-          CachePolicyId: !Ref ApplicationNoCachePolicy
-          OriginRequestPolicyId: !Ref ApplicationOriginRequestPolicy
-          Compress: true
-        ViewerCertificate:
-          CloudFrontDefaultCertificate: true
-          MinimumProtocolVersion: TLSv1.2_2021
-        Restrictions:
-          GeoRestriction:
-            RestrictionType: none
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
-        - Key: Environment
-          Value: !Ref Environment
-
-  PrivateDnsNamespace:
-    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
-    Properties:
-      Name: !Sub "${ProjectName}-${Environment}.local"
-      Vpc: !Ref Vpc
-
-  BackendDiscovery:
-    Type: AWS::ServiceDiscovery::Service
-    Properties:
-      Name: backend
-      NamespaceId: !Ref PrivateDnsNamespace
-      DnsConfig:
-        RoutingPolicy: MULTIVALUE
-        DnsRecords:
-          - Type: A
-            TTL: 10
-
-  BackendService:
-    Type: AWS::ECS::Service
-    DependsOn:
-      - HttpBackendApiListenerRule
-      - EcrApiEndpoint
-      - EcrDockerEndpoint
-      - CloudWatchLogsEndpoint
-      - SecretsManagerEndpoint
-      - AmpWorkspacesVpcEndpoint
-      - S3GatewayEndpoint
-    Properties:
-      ServiceName: !Sub "${ProjectName}-${Environment}-backend"
-      Cluster: !Ref EcsCluster
-      LaunchType: FARGATE
-      DesiredCount: !Ref ServiceDesiredCount
-      TaskDefinition: !Ref BackendTaskDefinition
-      DeploymentConfiguration:
-        MaximumPercent: 200
-        MinimumHealthyPercent: 100
-        DeploymentCircuitBreaker:
-          Enable: true
-          Rollback: true
-      NetworkConfiguration:
-        AwsvpcConfiguration:
-          AssignPublicIp: DISABLED
-          SecurityGroups:
-            - !Ref BackendSecurityGroup
-          Subnets:
-            - !Ref PrivateSubnetA
-            - !Ref PrivateSubnetB
-      ServiceRegistries:
-        - RegistryArn: !GetAtt BackendDiscovery.Arn
-      LoadBalancers:
-        - ContainerName: backend
-          ContainerPort: 4000
-          TargetGroupArn: !Ref BackendTargetGroup
-      HealthCheckGracePeriodSeconds: 120
-      EnableExecuteCommand: false
-
-  FrontendService:
-    Type: AWS::ECS::Service
-    DependsOn:
-      - HttpListener
-      - EcrApiEndpoint
-      - EcrDockerEndpoint
-      - CloudWatchLogsEndpoint
-      - S3GatewayEndpoint
-    Properties:
-      ServiceName: !Sub "${ProjectName}-${Environment}-frontend"
-      Cluster: !Ref EcsCluster
-      LaunchType: FARGATE
-      DesiredCount: !Ref ServiceDesiredCount
-      TaskDefinition: !Ref FrontendTaskDefinition
-      DeploymentConfiguration:
-        MaximumPercent: 200
-        MinimumHealthyPercent: 100
-        DeploymentCircuitBreaker:
-          Enable: true
-          Rollback: true
-      NetworkConfiguration:
-        AwsvpcConfiguration:
-          AssignPublicIp: DISABLED
-          SecurityGroups:
-            - !Ref FrontendSecurityGroup
-          Subnets:
-            - !Ref PrivateSubnetA
-            - !Ref PrivateSubnetB
-      LoadBalancers:
-        - ContainerName: frontend
-          ContainerPort: 3000
-          TargetGroupArn: !Ref FrontendTargetGroup
-      HealthCheckGracePeriodSeconds: 90
-      EnableExecuteCommand: false
-
-  DbCpuAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmDescription: RDS CPU utilization is above 80 percent.
-      Namespace: AWS/RDS
-      MetricName: CPUUtilization
-      Dimensions:
-        - Name: DBInstanceIdentifier
-          Value: !Ref Database
-      Statistic: Average
-      Period: 300
-      EvaluationPeriods: 3
-      Threshold: 80
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
 
 Outputs:
   ClusterName:
-    Value: !Ref EcsCluster
-  BackendServiceName:
-    Value: !Sub "${ProjectName}-${Environment}-backend"
-  FrontendServiceName:
-    Value: !Sub "${ProjectName}-${Environment}-frontend"
-  BackendTaskDefinitionArn:
-    Value: !Ref BackendTaskDefinition
-  BackendTargetGroupArn:
-    Value: !Ref BackendTargetGroup
-  FrontendTargetGroupArn:
-    Value: !Ref FrontendTargetGroup
-  PrivateSubnetAId:
-    Value: !Ref PrivateSubnetA
-  PrivateSubnetBId:
-    Value: !Ref PrivateSubnetB
-  BackendSecurityGroupId:
-    Value: !Ref BackendSecurityGroup
-  LoadBalancerDnsName:
-    Value: !GetAtt LoadBalancer.DNSName
-  CloudFrontDistributionId:
-    Value: !Ref ApplicationDistribution
-  CloudFrontDomainName:
-    Value: !GetAtt ApplicationDistribution.DomainName
-  ApplicationUrl:
-    Value: !Sub "https://${ApplicationDistribution.DomainName}"
+    Value: !Ref EksCluster
+  ClusterArn:
+    Value: !GetAtt EksCluster.Arn
+  KubernetesVersion:
+    Value: !Ref KubernetesVersion
   DatabaseEndpoint:
     Value: !GetAtt Database.Endpoint.Address
   DatabaseSecretArn:
     Value: !Ref DatabaseSecret
   MetricsSecretArn:
     Value: !Ref MetricsSecret
+  GrafanaSecretArn:
+    Value: !Ref GrafanaSecret
+  ApplicationNamespace:
+    Value: !Sub "${ProjectName}-${Environment}"

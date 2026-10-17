@@ -7,7 +7,9 @@
     required_commands:
       - aws
       - docker
+      - helm
       - jq
+      - kubectl
       - terraform
   tasks:
     - name: Check required executable availability

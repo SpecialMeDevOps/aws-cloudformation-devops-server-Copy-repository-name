@@ -40,10 +40,10 @@ Resources:
               },
               {
                 "rulePriority": 2,
-                "description": "Retain the most recent fifty immutable commit images",
+                "description": "Retain the most recent fifty immutable build images",
                 "selection": {
                   "tagStatus": "tagged",
-                  "tagPrefixList": ["sha-"],
+                  "tagPrefixList": ["build-", "sha-"],
                   "countType": "imageCountMoreThan",
                   "countNumber": 50
                 },
@@ -85,10 +85,10 @@ Resources:
               },
               {
                 "rulePriority": 2,
-                "description": "Retain the most recent fifty immutable commit images",
+                "description": "Retain the most recent fifty immutable build images",
                 "selection": {
                   "tagStatus": "tagged",
-                  "tagPrefixList": ["sha-"],
+                  "tagPrefixList": ["build-", "sha-"],
                   "countType": "imageCountMoreThan",
                   "countNumber": 50
                 },

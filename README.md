@@ -24,15 +24,15 @@ flowchart LR
     Jenkins --> Ansible[Ansible preflight and orchestration]
     Ansible --> Validate[Lint, typecheck, Prisma, tests]
     Validate --> Security[Semgrep, npm audit, Trivy]
-    Security --> Docker[Build and scan digest-bound images]
-    Docker --> Approval[Explicit Jenkins deployment approval]
+    Security --> Docker[Build images and Trivy scan for Critical]
+    Docker --> Approval[Only passing images receive unique ECR build tags]
     Approval --> Terraform[Terraform plans CloudFormation stacks]
     Terraform --> CFN[CloudFormation owns AWS resources]
-    CFN --> ECR[Amazon ECR]
-    ECR --> ECS[ECS Fargate]
-    ECS --> Health[Ansible health and service verification]
-    ECS --> AMP[Amazon Managed Prometheus]
-    AMP --> AMG[Amazon Managed Grafana]
+    CFN --> ECR[Existing Amazon ECR repositories]
+    ECR --> EKS[Amazon EKS managed node group]
+    EKS --> Health[Kubernetes rollout and health verification]
+    EKS --> Prometheus[Prometheus via kube-prometheus-stack]
+    Prometheus --> Grafana[In-cluster Grafana dashboard]
 
     Frontend[Next.js frontend] --> Backend[NestJS backend]
     Backend --> Postgres[PostgreSQL via Prisma]
@@ -148,7 +148,7 @@ Files created:
 
 Before running the pipeline, install the Jenkins NodeJS plugin and add a NodeJS installation named `NodeJS-22` under **Manage Jenkins → Tools**. The pipeline provisions that tool on the agent so `node` and `npm` are available in validation and build stages.
 
-The Prisma validation and backend image build use a non-production PostgreSQL placeholder URL only to validate the schema and generate the Prisma Client; they do not connect to a database. That build-stage value is not copied into the final backend image. At runtime, ECS injects database fields from Secrets Manager and the backend constructs its connection URL; the isolated migration task does the same without logging the URL.
+The Prisma validation and backend image build use a non-production PostgreSQL placeholder URL only to validate the schema and generate the Prisma Client; they do not connect to a database. That build-stage value is not copied into the final backend image. At runtime, Jenkins retrieves database credentials through the EC2 instance profile and streams them directly into Kubernetes Secret resources without logging the values. The backend constructs its connection URL from the resulting environment variables.
 
 Pipeline responsibilities:
 
@@ -163,11 +163,11 @@ Pipeline responsibilities:
 - Trivy filesystem dependency, secret, and supported infrastructure-configuration scans
 - frontend and backend Docker builds, Trivy vulnerability scans, and CycloneDX SBOM generation
 - Jenkins artifact reports under `reports/trivy/`
-- optional AWS identity verification, ECR publication by immutable commit tag and digest, CloudFormation deployment through Terraform, an approved Prisma migration task, ECS health checks, and monitoring verification
+- optional IAM role verification, ECR publication by unique build tag and verified image digest, EKS/RDS deployment through Terraform-managed CloudFormation, an approved Kubernetes Prisma migration Job, rollout/health checks, and Prometheus/Grafana verification
 
-Trivy is downloaded from the official Aqua Security GitHub release, pinned to `0.76.0`, and verified against the release checksum before use. The Jenkins parameter `TRIVY_FAIL_ON_SEVERITY` controls the filesystem, configuration, and secret gate and defaults to `CRITICAL`; choose `HIGH,CRITICAL`, `MEDIUM,HIGH,CRITICAL`, or `LOW,MEDIUM,HIGH,CRITICAL` to apply a stricter gate. The container-image gate is fixed at `HIGH,CRITICAL` and cannot be lowered by that parameter. Readable filesystem/configuration reports cover all four severities; image reports cover HIGH and CRITICAL findings. The secret report omits matched secret values; keep Jenkins artifact access restricted because scan findings can still disclose repository paths and vulnerability details.
+Trivy is downloaded from the official Aqua Security GitHub release, pinned to `0.76.0`, and verified against the release checksum before use. The image policy is fixed to `CRITICAL`: either image failing the Trivy vulnerability scan stops the pipeline before ECR push. `TRIVY_FAIL_ON_SEVERITY` continues to configure the separate filesystem/configuration/secret scans. Image SBOMs and reports are archived with restricted Jenkins access.
 
-Both production images upgrade Alpine packages during clean image builds and omit npm from the final runtime image. The frontend uses Next.js standalone output so its final image contains only traced runtime dependencies and static assets. Jenkins rebuilds both images with `--pull --no-cache` and the container-image Trivy gate always fails on HIGH or CRITICAL vulnerabilities before ECR publication. The full frontend npm audit still reports five HIGH advisories through the `eslint-config-next` development-tool chain (`braces` → `micromatch` → `fast-glob`); `npm audit --omit=dev` is clean, and these development packages are absent from the standalone runtime tree. Do not treat the full development dependency audit as clean.
+Both production images upgrade Alpine packages during clean image builds and omit npm from the final runtime image. The frontend uses Next.js standalone output so its final image contains only traced runtime dependencies and static assets. Jenkins rebuilds both images with `--pull --no-cache`; successful local image scans precede the ECR publish stage. Each build gets a unique tag and deployment uses the digest returned by ECR for that same pushed image. The full frontend npm audit still reports five HIGH advisories through the `eslint-config-next` development-tool chain (`braces` → `micromatch` → `fast-glob`); `npm audit --omit=dev` is clean, and these development packages are absent from the standalone runtime tree. Do not treat the full development dependency audit as clean.
 
 The Semgrep stage emits a JSON report; the dependency audit stage fails on high-severity npm findings while continuing later scans so reports can be collected. Trivy scans generate vulnerability/configuration JSON and readable summaries; the secret report omits matched values. Scan findings at or above the selected threshold fail the build. Keep Jenkins logs and artifacts access-controlled.
 
@@ -176,14 +176,14 @@ Important constraints:
 - GitHub webhooks must be authenticated and validated.
 - Jenkins should not be exposed publicly without HTTPS and access control.
 - Pull requests and untrusted branches are never deployed to AWS.
-- Jenkins uses the existing EC2 instance profile rather than static AWS access keys. The EC2 role must receive reviewed, least-privilege permissions for S3 Terraform state, ECR, CloudFormation, ECS, RDS, Secrets Manager, CloudWatch, AMP, AMG, and `iam:PassRole` for only the ECS/monitoring roles created by these stacks.
+- Jenkins uses the existing EC2 instance profile rather than static AWS access keys. Its role needs reviewed ECR, CloudFormation, EKS, EC2/VPC, RDS, Secrets Manager, Terraform state, and narrowly scoped `iam:PassRole` permissions for the cluster/node roles in the template.
 - The pipeline does not create the Terraform state bucket automatically. Bootstrap it once as documented below and review/migrate any existing Terraform state before enabling deployment; Ansible discovers the bucket from the bootstrap CloudFormation output unless `TF_STATE_BUCKET` is explicitly set.
 - Existing ECR repositories and the former Terraform-managed VPC are not auto-imported. The Terraform `removed` blocks prevent destruction only when the previous Terraform state is recovered and initialized. Existing CloudFormation stacks/resources must be imported or migrated before applying; a clean Terraform plan alone does not resolve resource ownership conflicts.
 - No AWS resources have been created or changed by the repository work. A successful local CI run is not evidence of an AWS deployment.
 
 ## Local Prometheus and Grafana
 
-The opt-in Compose overlay is for local development only; it does not deploy AWS infrastructure. The CloudFormation application stack defines ECS Fargate services, Container Insights, an internal AMP remote-write collector, and private RDS. A separate monitoring stack defines Amazon Managed Prometheus and Amazon Managed Grafana. Prometheus/Grafana/exporter ports are not opened on the public load balancer.
+The opt-in Compose overlay is for local development only; it does not deploy AWS infrastructure. AWS monitoring is deployed in the EKS cluster with the pinned `kube-prometheus-stack` Helm chart; there is no AMG/AMP stack or public monitoring service.
 
 The backend exports authenticated Prometheus metrics at `/metrics` only when `METRICS_TOKEN_FILE` is configured. It records low-cardinality HTTP method/route/status counts and latency histograms, plus Node process CPU and memory metrics. The Prometheus-owned Node client is pinned at `@prometheus-io/client` 0.16.1 and requires Node 22+, so the backend image uses Node 22. The frontend and backend expose basic health endpoints used by HTTP probes. cAdvisor provides local container CPU/memory metrics; its host filesystem mounts are read-only, and neither cAdvisor nor the blackbox exporter has a host-published port.
 
@@ -224,7 +224,7 @@ Verify Grafana and Prometheus health, including active scrape targets, from Git 
 sh monitoring/verify.sh
 ```
 
-This stack requires a Linux Docker engine for cAdvisor host metrics. Docker Desktop may expose its Linux VM's container metrics rather than Windows host resources. Do not expose the loopback ports or exporter services publicly. In AWS, Grafana uses an IAM role for CloudWatch and AMP queries and the provisioned dashboard is pushed with a Jenkins Secret Text credential named `grafana-api-token`. An AWS IAM Identity Center administrator must assign approved Grafana workspace users; the stack does not grant access to individual humans.
+This stack requires a Linux Docker engine for cAdvisor host metrics. Docker Desktop may expose its Linux VM's container metrics rather than Windows host resources. Do not expose the loopback ports or exporter services publicly. In AWS, Grafana and Prometheus are ClusterIP services only; use `kubectl port-forward` through the CIDR-restricted EKS API endpoint to view them.
 
 ## Infrastructure as code and automation
 
@@ -238,9 +238,9 @@ Folders:
 
 Ownership is deliberately separated:
 
-- Terraform manages only the three CloudFormation stacks (remote-state bootstrap, ECR registry, and application/monitoring).
-- CloudFormation is the sole owner of AWS resources, including VPC/networking, ECR, ECS/Fargate, RDS, IAM, AMP, and AMG.
-- Ansible performs Jenkins-agent preflight, invokes Terraform, runs a separately approved Prisma migration task, and verifies ECS/ALB/AMP/AMG health. It does not create duplicate AWS resources.
+- Terraform uses the separately bootstrapped remote state and manages the ECR registry and application CloudFormation stacks.
+- CloudFormation is the sole owner of AWS resources, including VPC/networking, ECR, EKS, EC2 managed nodes, RDS, Secrets Manager, and IAM.
+- Ansible checks the Jenkins agent and invokes Terraform; Jenkins applies Kubernetes manifests and Helm releases to the CloudFormation-owned EKS cluster. No AWS resource is independently managed by both Terraform and CloudFormation.
 
 The remote Terraform backend is an S3 bucket bootstrapped from `cloudformation/terraform-state-stack.yaml`. The bucket has versioning, customer-managed KMS encryption, public-access blocking, TLS-only access, and S3 lock files. The bootstrap stack creates and retains the KMS key, enables rotation, and grants the named Jenkins EC2 role key access. Bootstrap is an AWS change and is not run automatically by this repo work. An authorized operator must execute this from the approved Jenkins/EC2 environment after reviewing the template:
 
@@ -251,7 +251,7 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides \
     ProjectName=it-your-it-house \
-    TerraformStateRoleName="${TF_VAR_monitoring_instance_role_name:?Set the Jenkins EC2 instance-profile role name}" \
+    TerraformStateRoleName="<actual Jenkins EC2 IAM role name>" \
   --region us-east-1
 
 aws cloudformation describe-stacks \
@@ -263,109 +263,75 @@ aws cloudformation describe-stacks \
 
 The Ansible Terraform workflow reads the bucket name from the `TerraformStateBucketName` output of this bootstrap stack, so `TF_STATE_BUCKET` is optional. If set, `TF_STATE_BUCKET` overrides the discovered value. The stack grants the selected EC2 instance-profile role access to the state KMS key; that role must also be authorized to read/write/delete the state object and `.tflock` object in S3. When updating an existing bootstrap stack, review the CloudFormation change set and keep the retained state bucket and KMS key. Terraform >=1.10 is required for S3 lock-file support.
 
-**Do not enable `DEPLOY_TO_AWS` until the prior Terraform state and AWS ownership are reconciled.** The historical config managed ECR repositories and a VPC directly. The current Terraform has non-destroying `removed` blocks to protect those prior addresses only if the old state is recovered and migrated. If a repository, VPC, or stack already exists without a matching CloudFormation stack in the active remote state, Terraform cannot safely adopt it automatically. Import or migrate the existing resources/state in a separately reviewed change first. Do not apply a plan that proposes replacement or deletion. `destroy = false` intentionally leaves old resources alive and unmanaged; an old VPC may include a billable NAT gateway, so inventory and migrate/retire it through an approved change before creating a duplicate network.
+**Do not enable `DEPLOY_TO_AWS` until the prior Terraform state and AWS ownership are reconciled.** The historical config managed ECR repositories and a VPC directly. The current Terraform has non-destroying `removed` blocks to protect those prior addresses only if the old state is recovered and migrated. Ansible blocks Terraform planning while `module.network` remains in remote state and blocks an in-place application-stack update while the existing stack still contains ECS, ALB, or CloudFront resources. If a repository, VPC, or stack already exists without a matching CloudFormation stack in the active remote state, Terraform cannot safely adopt it automatically. Import or migrate the existing resources/state in a separately reviewed change first. Do not apply a plan that proposes replacement or deletion. `destroy = false` intentionally leaves old resources alive and unmanaged; an old VPC may include a billable NAT gateway, so inventory and migrate/retire it through an approved change before creating a duplicate network.
 
-Application and monitoring stacks are created only on the `main` branch when `DEPLOY_TO_AWS=true`; Jenkins pauses for plan approval. The first application release creates a generated-password PostgreSQL database and runs the checked-in additive Prisma migration as a separate ECS task. Do not use this initial migration against an existing database without first checking/baselining its schema and making a tested backup.
+The application stack is planned/applied only on the `main` branch when `DEPLOY_TO_AWS=true`; Jenkins pauses for infrastructure and database-migration approvals. The application CloudFormation stack creates a generated-password PostgreSQL database. Jenkins runs the checked-in Prisma migration as a Kubernetes Job after a separate manual approval. Do not use this initial migration against an existing database without first checking/baselining its schema and making a tested backup.
 
-The current templates create billable resources including an ALB, a CloudFront distribution, RDS, Fargate tasks, interface VPC endpoints, CloudWatch Container Insights/log ingestion, Amazon Managed Prometheus (AMP), Amazon Managed Grafana (AMG), ECR image storage, and data transfer. The application template does not define a NAT Gateway or Elastic IP. AMP/AMG, RDS, the ALB, interface endpoints, CloudFront requests/data transfer, and logs can accrue charges while idle or in use; actual charges vary by region, usage, and duration. Estimate the planned lifetime in the AWS Pricing Calculator and inspect the Terraform plan before every approval. No live deployment or account-specific cost estimate is claimed.
+The current templates create billable resources including an EKS control plane, two EC2 worker nodes, RDS, CloudWatch logs, ECR image storage, and data transfer. The application template does not define a NAT Gateway or Elastic IP. EKS, EC2, RDS/storage/backups, and logs can accrue charges while idle or in use; actual charges vary by region, usage, and duration. Estimate the planned lifetime in the AWS Pricing Calculator and inspect the Terraform plan before every approval. No live deployment or account-specific cost estimate is claimed.
 
-### Temporary portfolio demo: HTTPS requirements and cleanup
+### AWS EKS portfolio deployment
 
-The temporary demo uses CloudFront's AWS-generated `cloudfront.net` HTTPS hostname and a CloudFront VPC origin. The ALB is internal in the existing private subnets, listens on HTTP only, and accepts ingress only from AWS's managed CloudFront origin-facing prefix list; it has no public HTTP/HTTPS endpoint. Browser-to-CloudFront traffic uses the AWS-managed TLS certificate. CloudFront-to-ALB traffic uses the VPC-origin private path and HTTP, not application-layer TLS; this design keeps that hop off the public internet but does not provide end-to-end TLS. If end-to-end TLS is required, use a controlled domain and a certificate for the origin rather than this domainless demo.
+This workflow uses Terraform to create/update CloudFormation stacks for the existing ECR repositories and the EKS application infrastructure. Jenkins builds both existing Dockerfiles, runs Trivy on both images, and stops before ECR publication if either image has a Critical vulnerability. Passing images are pushed with unique build tags; deployment consumes the exact ECR digests returned for those tags. An approved Terraform application plan creates the EKS cluster, managed nodes, private PostgreSQL database, and IAM access entries. Jenkins then creates the Kubernetes application secrets/configuration, runs the Prisma migration only after a separate manual approval, deploys the workloads, and verifies service rollout and Prometheus scraping. It installs the pinned kube-prometheus-stack Helm chart in-cluster; Grafana and application services are ClusterIP-only, with no public ALB, CloudFront, Route 53, certificate, or public app endpoint.
 
-Before an approved temporary demo deployment, collect and verify this checklist:
+Before enabling `DEPLOY_TO_AWS`, verify all of the following:
 
-- Jenkins build is from `main`; set `DEPLOY_TO_AWS=true`. Keep the Trivy gate at `HIGH,CRITICAL` (the default) and approve only the reviewed Terraform plans and database migration.
-- No custom domain, ACM certificate ARN, or viewer CIDR is required. Jenkins resolves the regional AWS-managed S3 prefix list and CloudFront origin-facing prefix list; CloudFormation restricts the private ALB to the latter.
-- Jenkins uses the EC2 instance profile; its assumed-role ARN is used to derive the existing role name. The role must have only reviewed deployment permissions, including the required ECR/CloudFormation/CloudFront/ECS/RDS/Secrets Manager/CloudWatch/AMP/AMG actions, `ec2:DescribeManagedPrefixLists`, and narrowly scoped `iam:PassRole`. Do not deploy while the role has broad administrator permissions.
-- The Terraform S3 backend must resolve to the existing bootstrap state bucket, and its current state must be reconciled with AWS ownership. Moving an existing internet-facing ALB to private subnets changes its scheme and requires replacement. Review the plan for that ALB replacement and any deletion-protection impact; stop if it proposes changes to unrelated or pre-existing resources.
-- Frontend/backend images and SHA-256 digests are built, scanned, pushed, and checked by the existing Jenkins stages; do not manually supply or substitute digests.
-- After the application stack is created, Jenkins prints the generated CloudFront HTTPS URL. The services are intentionally at zero before the approved database migration, so the app will not be healthy yet; Ansible verifies both health endpoints after the migration and the separately approved service enablement. CloudFront VPC origin and distribution deployment can take several minutes.
-- For screenshots of AMG, first assign an approved user through AWS IAM Identity Center. Store a Grafana service-account token in the Jenkins Secret Text credential `grafana-api-token`; use it only for dashboard provisioning. The Grafana workspace URL is printed by the pipeline. Never publish tokens, OTPs, session values, or database details in screenshots.
+- Use the `main` branch and enable the Jenkins parameter `DEPLOY_TO_AWS`. Supply `KUBERNETES_OPERATOR_PRINCIPAL_ARN` as a real IAM user/role ARN in the same AWS account, distinct from the Jenkins role. Supply `KUBERNETES_API_ACCESS_CIDRS` as comma-separated trusted IPv4 CIDRs for the operator; `/0` is rejected. Jenkins discovers and adds its own public egress `/32`. Confirm the configured `KUBERNETES_VERSION` is supported in the selected region; the current default is `1.34`.
+- Jenkins must run on the intended EC2 instance profile, with the reviewed least-privilege ECR, CloudFormation, EKS, EC2/VPC, RDS, Secrets Manager, S3 state and narrowly scoped `iam:PassRole` permissions. Do not add static AWS keys. The selected operator needs IAM permission to obtain EKS credentials and the namespace-scoped EKS access policy created by the stack.
+- Reconcile the existing Terraform remote state and CloudFormation/ECR ownership before applying. The available local AWS CLI identity did not establish what Jenkins can see. Stop if the Terraform plan replaces/deletes an unrelated or pre-existing resource.
+- The deployment creates a new VPC and EKS control plane with two managed worker nodes, a private RDS instance, Secrets Manager secrets, ECR storage, and CloudWatch logs. There is no NAT Gateway; nodes have public IPs for outbound package/image downloads, but the EKS API is restricted to the supplied CIDRs plus Jenkins egress. The app, database, and Grafana have no public listener. Review the full plan and current AWS pricing before approval; EKS control-plane hours, EC2 nodes, RDS/storage/backups, CloudWatch ingestion/storage, ECR storage, and data transfer can incur charges for the duration of the demo.
+- The app is exposed only through local port forwarding. From a trusted operator workstation with AWS CLI and `kubectl` configured for the same region/account:
 
-This is not a zero-cost deployment. The ALB, CloudFront distribution usage, RDS instance/storage/backups, two Fargate services, interface VPC endpoints, AMP/AMG workspaces, CloudWatch logs/Container Insights, ECR storage, and data transfer can all incur charges. The RDS database, ALB deletion protection, and retained ECR repositories require explicit cleanup steps; CloudFormation snapshots the database when its stack is deleted. A final snapshot and retained ECR images continue to incur storage charges until deliberately removed.
+  ```sh
+  aws eks update-kubeconfig --region us-east-1 --name it-your-it-house-dev-cluster
+  kubectl -n it-your-it-house-dev port-forward svc/frontend 3000:3000
+  ```
 
-After the screenshots, clean up only after confirming the AWS account, region, stack names, Terraform backend, and resources belong to this temporary demo. Run this from the same initialized Terraform workspace/backend used for deployment:
+  Open `http://127.0.0.1:3000`. For the private Grafana dashboard, use a second terminal:
 
-1. Inspect the physical IDs for the application database, ALB, CloudFront distribution, and VPC origin:
+  ```sh
+  kubectl -n monitoring port-forward svc/monitoring-grafana 3001:80
+  ```
 
-   ```sh
-   aws cloudformation describe-stack-resources \
-     --stack-name it-your-it-house-dev-application \
-     --region us-east-1 \
-     --query "StackResources[?LogicalResourceId=='Database' || LogicalResourceId=='LoadBalancer' || LogicalResourceId=='ApplicationDistribution' || LogicalResourceId=='CloudFrontVpcOrigin'].[LogicalResourceId,PhysicalResourceId]" \
-     --output table
-   ```
+  Then open `http://127.0.0.1:3001`. Use username `admin`; retrieve the generated password with `kubectl -n monitoring get secret grafana-admin -o jsonpath='{.data.admin-password}' | base64 --decode` from the authorized operator identity. Port-forward traffic is loopback-local; kubectl's connection to the IAM-authenticated EKS API uses TLS. Never enter real user credentials or display secrets in portfolio screenshots. The application is a demo, not production authentication software.
+- The deployment is not verified until the actual Jenkins AWS identity has applied an approved plan and the build's rollout/scrape checks pass. No apply or deployment is performed by the local validation steps in this repository change.
 
-2. Only after verifying the database and ALB physical IDs belong to this demo, disable their deletion protections so CloudFormation can remove the stack. Substitute those physical IDs returned above; do not guess them:
+For cleanup, first confirm the account, region, Terraform backend/state key, and exact application stack ownership. From the same initialized Terraform backend used for deployment, review the destroy plan and only apply it if every deletion is expected and demo-owned:
 
-   ```sh
-   aws rds modify-db-instance \
-     --db-instance-identifier '<verified-Database-physical-id>' \
-     --no-deletion-protection \
-     --apply-immediately \
-     --region us-east-1
+```sh
+terraform -chdir=terraform plan -destroy -input=false -out=demo-cleanup.tfplan
+terraform -chdir=terraform show -no-color demo-cleanup.tfplan
+# Only after reviewing and approving the saved plan:
+terraform -chdir=terraform apply -input=false demo-cleanup.tfplan
+```
 
-   aws elbv2 modify-load-balancer-attributes \
-     --load-balancer-arn '<verified-LoadBalancer-physical-id>' \
-     --attributes Key=deletion_protection.enabled,Value=false \
-     --region us-east-1
-   ```
+Before applying the reviewed destroy plan, disable deletion protection on the demo database; verify its identifier against the CloudFormation stack and account first:
 
-   Wait for RDS to return to `available`, then verify deletion protection is false and the ALB attribute is false before continuing.
+```sh
+aws rds modify-db-instance \
+  --db-instance-identifier it-your-it-house-dev-postgres \
+  --no-deletion-protection \
+  --apply-immediately \
+  --region us-east-1
+aws rds wait db-instance-available \
+  --db-instance-identifier it-your-it-house-dev-postgres \
+  --region us-east-1
+```
 
-3. Create and inspect a destroy plan. With the Jenkinsfile's default `TF_VAR_deploy_application=false`, the application and monitoring CloudFormation stacks in state are removed, and Terraform also plans to delete its managed registry stack. Do not run `terraform destroy` from a fresh/uninitialized local state. Review the plan and proceed only if every deletion is an expected demo-owned CloudFormation stack; stop for any other deletion. Applying this reviewed plan does not delete the separately bootstrapped Terraform state stack/bucket:
-
-   ```sh
-   terraform -chdir=terraform plan -destroy -input=false -out=demo-cleanup.tfplan
-   terraform -chdir=terraform show -no-color demo-cleanup.tfplan
-   # After reviewing and approving the saved plan:
-   terraform -chdir=terraform apply -input=false demo-cleanup.tfplan
-   ```
-
-4. The application database has `DeletionPolicy: Snapshot`; inspect the manual snapshots for the verified database and delete only the final snapshot created during cleanup if its data is no longer required:
-
-   ```sh
-   aws rds describe-db-snapshots \
-     --db-instance-identifier '<verified-Database-physical-id>' \
-     --snapshot-type manual \
-     --region us-east-1 \
-     --query 'DBSnapshots[].{Snapshot:DBSnapshotIdentifier,Created:SnapshotCreateTime,Status:Status}' \
-     --output table
-
-   aws rds delete-db-snapshot \
-     --db-snapshot-identifier '<verified-demo-final-snapshot-id>' \
-     --region us-east-1
-   ```
-
-   The registry repositories have `DeletionPolicy: Retain`, so deleting the registry stack leaves ECR repositories and images behind. Verify repository ownership, tags, creation time, and that no other workload uses them before deliberately deleting those exact demo repositories/images. Do not delete pre-existing or shared repositories:
-
-   ```sh
-   aws ecr delete-repository \
-     --repository-name it-your-it-house-frontend \
-     --force \
-     --region us-east-1
-   aws ecr delete-repository \
-     --repository-name it-your-it-house-backend \
-     --force \
-     --region us-east-1
-   ```
-5. Confirm the application and monitoring CloudFormation stacks are gone and ECS tasks/services, ALB, CloudFront distribution and VPC origin, RDS instance, AMP, AMG, VPC endpoints, log groups, and stack-created IAM policies/roles are removed. CloudFormation manages deletion of the CloudFront distribution and its VPC origin; do not delete them manually while the stack is active. Remove any demo-only Grafana Jenkins credential and any demo-specific Grafana user assignment only after confirming they are not shared.
-6. Do not delete `it-your-it-house-terraform-state`, its S3 state bucket, its KMS key, Terraform state/lock objects, the Jenkins EC2 role, or unrelated resources.
+This removes the Terraform-managed registry and application CloudFormation stacks, including EKS, worker nodes, RDS, secrets, VPC/network resources, and cluster monitoring. ECR repositories are retained by policy; delete images/repositories only after verifying they are dedicated to this demo and unused. Do not delete the separately bootstrapped Terraform state stack, state bucket, KMS key, state/lock objects, Jenkins IAM role, or unrelated resources. Check for any retained RDS snapshot, ECR images, and CloudWatch log groups after stack deletion; remove only verified demo-owned leftovers if no longer needed. The deployment stack has not been applied or cleaned up by these changes.
 
 Jenkins setup:
 
 - EC2/Linux agent prerequisites: NodeJS 22 via the Jenkins NodeJS plugin (tool name `NodeJS-22`), Docker Engine with access granted only to the trusted Jenkins agent, Terraform >=1.10, AWS CLI v2, Ansible, `jq`, `curl`, `sha256sum`, and `tar`. Docker-group membership is effectively root access; use only on a dedicated trusted agent, never loosen socket permissions.
-- Use the EC2 instance profile, not static AWS access keys. The deployment pipeline derives `TF_VAR_monitoring_instance_role_name` from the STS assumed-role identity and rejects non-role identities; keep the Jenkins EC2 instance profile attached to the intended role. For an AWS deployment build, set `DEPLOY_TO_AWS=true`; no hostname, ACM certificate, or ingress-CIDR parameters are needed. Jenkins discovers the CloudFront origin-facing managed prefix list. The Jenkins role needs `ec2:DescribeManagedPrefixLists` (already used to discover the S3 prefix list), reviewed CloudFormation/CloudFront actions, and narrowly scoped `iam:PassRole`; no ACM describe permission is needed for this architecture. For manual state-stack bootstrap, set `TF_VAR_monitoring_instance_role_name` to the actual Jenkins instance-profile role name. Set `TF_STATE_BUCKET` only if you need to override the bootstrap stack output. Restrict IAM actions and `iam:PassRole` to only the resources/roles needed by these templates.
-- Jenkins must have the Credentials plugin and a Secret Text credential ID `grafana-api-token`. After the AMG workspace is created, an AWS IAM Identity Center administrator must assign approved workspace users, create a Grafana service-account token, and store it in that credential. The pipeline binds it only for dashboard/data-source provisioning; Ansible suppresses token-bearing task output.
+- Use the EC2 instance profile, not static AWS access keys. Jenkins derives the deployment role ARN from its STS assumed-role identity; keep the EC2 instance profile attached to the intended role. Set `DEPLOY_TO_AWS=true` and provide the `KUBERNETES_OPERATOR_PRINCIPAL_ARN` and `KUBERNETES_API_ACCESS_CIDRS` values described above. `KUBERNETES_VERSION` defaults to `1.34`; verify regional support before deployment. For manual state-stack bootstrap, replace the `TerraformStateRoleName` placeholder with the actual Jenkins EC2 instance-profile role name from the STS assumed-role ARN. Set `TF_STATE_BUCKET` only if you need to override the bootstrap stack output. The operator IAM identity needs `eks:DescribeCluster` and the EKS access entry created by the stack. Restrict IAM actions and `iam:PassRole` to only the resources/roles needed by these templates.
+- No Grafana Jenkins token or IAM Identity Center workspace assignment is needed. Grafana's generated admin password is stored in the application's Secrets Manager secret and is available only to appropriately authorized AWS identities.
 - `ansible/playbooks/jenkins-setup.yml` is host-mutating and intentionally fails unless explicitly run with `-e allow_host_package_changes=true`; it does not configure Docker socket permissions or the AWS instance profile.
 - Jenkins must be accessible only through approved authenticated HTTPS access. Artifact access must be restricted because SBOMs and scan reports reveal dependency details and repository paths.
-- **Do not expose the current application as production.** The demo OTP endpoint returns the generated code and session tokens are demo-shaped; server-side authentication/authorization is not production-ready. The CloudFront URL is publicly reachable, so use only demo data and never real credentials, OTPs, sessions, or customer information. The ALB is internal and only accepts CloudFront origin-facing traffic; this network restriction is not a substitute for fixing auth/RBAC before any public launch.
-- Each deployment conservatively sets ECS desired count to zero before the separately approved one-off Prisma migration, then requires a second reviewed Terraform plan to enable traffic. This causes deployment downtime; a migration failure leaves services stopped rather than serving against an unverified schema.
+- **Do not expose the current application as production.** The demo OTP endpoint returns the generated code and session tokens are demo-shaped; server-side authentication/authorization is not production-ready. The application and Grafana have no public listener; access requires IAM-authenticated, CIDR-restricted EKS API access and local port forwarding. Use demo data only and never real credentials, OTPs, sessions, or customer information. This network restriction is not a substitute for fixing auth/RBAC before any public launch.
+- Jenkins waits for the separately approved one-off Prisma migration before applying the app workloads. The deployment fails rather than marking success if the migration, pod readiness, application health endpoints, or Prometheus scrape check fails.
 
 ## Security, scanning and release gates
 
-Semgrep, npm audit, Trivy filesystem/secret/configuration/image scans, CycloneDX SBOMs, frontend/backend lint/type checking, Prisma validation, tests, and build checks are wired into Jenkins. The Trivy severity gate defaults to HIGH and CRITICAL and is adjustable via the pipeline parameter. Infrastructure misconfiguration findings are not ignored. Terraform plans require manual approval; AWS publishing/deployment is gated by `DEPLOY_TO_AWS` and `main`.
+Semgrep, npm audit, Trivy filesystem/secret/configuration/image scans, CycloneDX SBOMs, frontend/backend lint/type checking, Prisma validation, tests, and build checks are wired into Jenkins. The filesystem/configuration/secret Trivy severity gate defaults to HIGH and CRITICAL and is adjustable via the pipeline parameter. The image gate is fixed to CRITICAL and cannot be lowered by the parameter. Infrastructure misconfiguration findings are not ignored. Terraform plans and the Prisma migration require manual approval; AWS publishing/deployment is gated by `DEPLOY_TO_AWS` and `main`.
 
 CloudFormation templates, remote state, and the Jenkins host have not been validated or deployed against the target AWS account. Add dedicated `cfn-lint`, `ansible-lint`, and Terraform security scanning (for example Checkov) only after pinning versions, reviewing their policy behavior, and adding CI reports. Do not describe the Jenkins host setup playbook as a real scan.
 
