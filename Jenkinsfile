@@ -373,7 +373,7 @@ pipeline {
           const region = process.env.AWS_REGION;
 
           if (!/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?[.])+[a-z]{2,63}$/i.test(hostname)) {
-            throw new Error('APPLICATION_HOSTNAME must be a fully qualified hostname you control.');
+            throw new Error('APPLICATION_HOSTNAME must be a DNS hostname you control. The HTTPS ALB requires an issued ACM certificate for that hostname; AWS-generated ALB or CloudFront hostnames cannot satisfy this. An HTTP origin is not allowed for authentication traffic.');
           }
           if (!new RegExp('^arn:aws:acm:' + region + ':[0-9]{12}:certificate/[0-9a-f-]{36}$', 'i').test(certificateArn)) {
             throw new Error('ACM_CERTIFICATE_ARN must be a certificate ARN in AWS_REGION.');
