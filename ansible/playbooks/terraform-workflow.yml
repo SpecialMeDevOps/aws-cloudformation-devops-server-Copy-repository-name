@@ -71,10 +71,10 @@
           - lookup('env', 'TF_VAR_kubernetes_operator_principal_arn') is match("^arn:aws:iam::[0-9]{12}:(role|user)/.+$")
           - cluster_api_access_cidrs | length > 0
           - "'0.0.0.0/0' not in cluster_api_access_cidrs"
-          - lookup('env', 'TF_VAR_kubernetes_version') is match("^1\\.[0-9]{2}$")
+          - lookup('env', 'TF_VAR_kubernetes_version') is match("^1\\.(2[8-9]|[3-9][0-9])$")
         fail_msg: >-
           EKS deployment requires the Jenkins IAM role ARN, a distinct Kubernetes
-          operator IAM principal, a supported Kubernetes minor version, and
+          operator IAM principal, Kubernetes 1.28+ for default API data encryption, and
           explicitly allowlisted client CIDRs. Image digests are verified and
           supplied to Kubernetes only after the Trivy-gated ECR push.
       when:

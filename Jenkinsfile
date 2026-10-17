@@ -223,15 +223,58 @@ pipeline {
                   select(.Severity as $severity | ($threshold | split(",")) | index($severity))] | length' "$1"
             }
             vulnerability_count="$(threshold_count reports/trivy/filesystem-vulnerabilities.json)"
-            config_count="$(threshold_count reports/trivy/infrastructure-misconfigurations.json)"
+            today_utc="$(date -u +%Y%m%d)"
+            api_exception_active=false
+            encryption_exception_active=false
+            if [ "$today_utc" -lt 20270117 ]; then
+              api_exception_active=true
+            fi
+            if [ "$today_utc" -lt 20271017 ]; then
+              encryption_exception_active=true
+            fi
+            config_count="$(jq --arg threshold "$TRIVY_FAIL_ON_SEVERITY" \
+              --arg api_exception_active "$api_exception_active" \
+              --arg encryption_exception_active "$encryption_exception_active" '
+              [
+                .Results[]? as $result | $result.Misconfigurations[]? |
+                select(.Severity as $severity | ($threshold | split(",")) | index($severity)) |
+                select(
+                  !(($result.Target == "cloudformation/application-stack.yaml") and
+                    (.ID == "AWS-0039") and
+                    ($encryption_exception_active == "true")) and
+                  !(($result.Target == "cloudformation/application-stack.yaml") and
+                    (.ID == "AWS-0040") and
+                    ($api_exception_active == "true"))
+                )
+              ] | length
+            ' reports/trivy/infrastructure-misconfigurations.json)"
+            accepted_config_count="$(jq --arg threshold "$TRIVY_FAIL_ON_SEVERITY" \
+              --arg api_exception_active "$api_exception_active" \
+              --arg encryption_exception_active "$encryption_exception_active" '
+              [
+                .Results[]? as $result | $result.Misconfigurations[]? |
+                select(.Severity as $severity | ($threshold | split(",")) | index($severity)) |
+                select(
+                  (($result.Target == "cloudformation/application-stack.yaml") and
+                   (.ID == "AWS-0039") and
+                   ($encryption_exception_active == "true")) or
+                  (($result.Target == "cloudformation/application-stack.yaml") and
+                   (.ID == "AWS-0040") and
+                   ($api_exception_active == "true"))
+                )
+              ] | length
+            ' reports/trivy/infrastructure-misconfigurations.json)"
             secret_count="$(jq --arg threshold "$TRIVY_FAIL_ON_SEVERITY" \
               '[.Results[]? | .Secrets[]? |
                 select(.Severity as $severity | ($threshold | split(",")) | index($severity))] | length' \
               "$TRIVY_HOME/secrets-private.json")"
             rm -f -- "$TRIVY_HOME/secrets-private.json"
 
-            printf 'Threshold %s: filesystem=%s config=%s secrets=%s\\n' \
-              "$TRIVY_FAIL_ON_SEVERITY" "$vulnerability_count" "$config_count" "$secret_count"
+            printf 'Threshold %s: filesystem=%s actionable-config=%s accepted-config-exceptions=%s secrets=%s\\n' \
+              "$TRIVY_FAIL_ON_SEVERITY" "$vulnerability_count" "$config_count" "$accepted_config_count" "$secret_count"
+            if [ "$accepted_config_count" -gt 0 ]; then
+              printf 'Time-limited, documented EKS config exceptions: AWS-0039 (EKS 1.28+ AWS-owned-key encryption; review by 2027-10-17), AWS-0040 (IAM-authenticated API allowlisted to Jenkins/operator CIDRs; review by 2027-01-17).\\n'
+            fi
             if [ "$vulnerability_count" -gt 0 ] || [ "$config_count" -gt 0 ] || [ "$secret_count" -gt 0 ]; then
               if [ "$vulnerability_count" -gt 0 ]; then
                 echo 'Filesystem findings (severity, CVE, target, package, title):'
@@ -366,8 +409,8 @@ pipeline {
           if (params.KUBERNETES_OPERATOR_PRINCIPAL_ARN == env.TF_VAR_jenkins_role_arn) {
             error('KUBERNETES_OPERATOR_PRINCIPAL_ARN must be distinct from the Jenkins deployment role.')
           }
-          if (!params.KUBERNETES_VERSION.matches('1\\.[0-9]{2}')) {
-            error('KUBERNETES_VERSION must be a supported EKS Kubernetes minor version such as 1.34.')
+          if (!params.KUBERNETES_VERSION.matches('1\\.(2[8-9]|[3-9][0-9])')) {
+            error('KUBERNETES_VERSION must be EKS 1.28 or newer for default Kubernetes API data encryption.')
           }
 
           def clientCidrs = params.KUBERNETES_API_ACCESS_CIDRS

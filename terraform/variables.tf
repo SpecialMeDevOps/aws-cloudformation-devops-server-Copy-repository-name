@@ -27,8 +27,8 @@ variable "kubernetes_version" {
   type        = string
   default     = "1.34"
   validation {
-    condition     = can(regex("^1\\.[0-9]{2}$", var.kubernetes_version))
-    error_message = "kubernetes_version must be an EKS Kubernetes minor version such as 1.34."
+    condition     = can(regex("^1\\.(2[8-9]|[3-9][0-9])$", var.kubernetes_version))
+    error_message = "kubernetes_version must be EKS 1.28 or newer to retain default envelope encryption for Kubernetes API data."
   }
 }
 
