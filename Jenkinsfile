@@ -42,7 +42,7 @@ pipeline {
   }
 
   environment {
-    PATH+CI_TOOLS = "${WORKSPACE}@tmp/ci-tools/bin"
+    PATH = "${env.WORKSPACE}@tmp/ci-tools/bin:${env.PATH}"
     NODE_ENV = 'test'
     APP_NAME = 'it-your-it-house'
     AWS_REGION = 'us-east-1'
