@@ -39,6 +39,19 @@
       async: 1800
       poll: 15
 
+    - name: Wait for the CloudFront distribution to finish deploying
+      ansible.builtin.command:
+        argv:
+          - aws
+          - cloudfront
+          - wait
+          - distribution-deployed
+          - --id
+          - "{{ infrastructure_outputs.application_outputs.value.CloudFrontDistributionId }}"
+      changed_when: false
+      async: 2400
+      poll: 15
+
     - name: Verify frontend health endpoint
       ansible.builtin.uri:
         url: "{{ infrastructure_outputs.application_outputs.value.ApplicationUrl }}/api/health"

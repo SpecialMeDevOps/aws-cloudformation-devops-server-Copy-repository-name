@@ -46,18 +46,16 @@ resource "aws_cloudformation_stack" "application" {
   depends_on    = [aws_cloudformation_stack.monitoring]
 
   parameters = {
-    ProjectName            = var.project_name
-    Environment            = var.environment
-    ApplicationHostname    = var.application_hostname
-    FrontendImageUri       = var.frontend_image_uri
-    BackendImageUri        = var.backend_image_uri
-    CertificateArn         = var.certificate_arn
-    AllowedWebIngressCidr  = var.allowed_web_ingress_cidr
-    DbInstanceClass        = var.db_instance_class
-    ServiceDesiredCount    = var.service_desired_count
-    S3ManagedPrefixListId  = var.s3_managed_prefix_list_id
-    AmpRemoteWriteEndpoint = aws_cloudformation_stack.monitoring[0].outputs["RemoteWriteEndpoint"]
-    AmpWorkspaceArn        = aws_cloudformation_stack.monitoring[0].outputs["WorkspaceArn"]
+    ProjectName                  = var.project_name
+    Environment                  = var.environment
+    FrontendImageUri             = var.frontend_image_uri
+    BackendImageUri              = var.backend_image_uri
+    CloudFrontOriginPrefixListId = var.cloudfront_origin_prefix_list_id
+    DbInstanceClass              = var.db_instance_class
+    ServiceDesiredCount          = var.service_desired_count
+    S3ManagedPrefixListId        = var.s3_managed_prefix_list_id
+    AmpRemoteWriteEndpoint       = aws_cloudformation_stack.monitoring[0].outputs["RemoteWriteEndpoint"]
+    AmpWorkspaceArn              = aws_cloudformation_stack.monitoring[0].outputs["WorkspaceArn"]
   }
 
   capabilities = ["CAPABILITY_IAM", "CAPABILITY_NAMED_IAM"]

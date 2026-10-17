@@ -24,7 +24,7 @@ output "monitoring_outputs" {
 }
 
 output "application_url" {
-  description = "HTTPS URL at the configured application hostname, null until application deployment."
+  description = "CloudFront default HTTPS URL, null until application deployment."
   value       = var.deploy_application ? aws_cloudformation_stack.application[0].outputs["ApplicationUrl"] : null
 }
 

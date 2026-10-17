@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: Private ECS Fargate application, public ALB, and encrypted PostgreSQL database.
+Description: Private ECS Fargate application, CloudFront VPC origin, and encrypted PostgreSQL database.
 
 Parameters:
   ProjectName:
@@ -8,10 +8,6 @@ Parameters:
   Environment:
     Type: String
     Default: dev
-  ApplicationHostname:
-    Type: String
-    AllowedPattern: "^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)+[A-Za-z]{2,63}$"
-    ConstraintDescription: Provide the DNS hostname covered by the ACM certificate and pointed at this load balancer.
   FrontendImageUri:
     Type: String
     AllowedPattern: ".+@sha256:[a-f0-9]{64}"
@@ -30,14 +26,10 @@ Parameters:
     Type: String
     AllowedPattern: "pl-[0-9a-f]+"
     Description: Region-specific AWS-managed S3 prefix list ID for ECR image layer downloads.
-  CertificateArn:
+  CloudFrontOriginPrefixListId:
     Type: String
-    AllowedPattern: "^arn:aws:acm:[a-z0-9-]+:[0-9]{12}:certificate/[0-9a-fA-F-]{36}$"
-    Description: ACM certificate ARN in this region; the application load balancer serves HTTPS only.
-  AllowedWebIngressCidr:
-    Type: String
-    AllowedPattern: "([0-9]{1,3}\\.){3}[0-9]{1,3}/([1-9]|[1-2][0-9]|3[0-2])"
-    ConstraintDescription: Provide an explicit trusted client CIDR; 0.0.0.0/0 is not allowed.
+    AllowedPattern: "pl-[0-9a-f]+"
+    Description: AWS-managed CloudFront origin-facing prefix list ID for this region.
   DbInstanceClass:
     Type: String
     Default: db.t4g.micro
@@ -171,7 +163,7 @@ Resources:
   LoadBalancerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow web access to the application load balancer.
+      GroupDescription: Allow CloudFront origin-facing traffic to the private application load balancer.
       VpcId: !Ref Vpc
       SecurityGroupEgress:
         - IpProtocol: tcp
@@ -183,11 +175,11 @@ Resources:
           ToPort: 4000
           CidrIp: 10.42.10.0/23
       SecurityGroupIngress:
-        - Description: Allow HTTPS only from the configured ingress CIDR.
+        - Description: Allow only CloudFront origin-facing traffic to the private origin.
           IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: !Ref AllowedWebIngressCidr
+          FromPort: 80
+          ToPort: 80
+          SourcePrefixListId: !Ref CloudFrontOriginPrefixListId
   FrontendSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -630,13 +622,13 @@ Resources:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
       Type: application
-      Scheme: internet-facing
+      Scheme: internal
       IpAddressType: ipv4
       SecurityGroups:
         - !Ref LoadBalancerSecurityGroup
       Subnets:
-        - !Ref PublicSubnetA
-        - !Ref PublicSubnetB
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
       LoadBalancerAttributes:
         - Key: deletion_protection.enabled
           Value: "true"
@@ -674,25 +666,22 @@ Resources:
       UnhealthyThresholdCount: 3
       HealthCheckIntervalSeconds: 30
 
-  HttpsListener:
+  HttpListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
       LoadBalancerArn: !Ref LoadBalancer
-      Port: 443
-      Protocol: HTTPS
-      Certificates:
-        - CertificateArn: !Ref CertificateArn
-      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Port: 80
+      Protocol: HTTP
       DefaultActions:
         - Type: forward
           TargetGroupArn: !Ref FrontendTargetGroup
 
-  HttpsBackendApiListenerRule:
+  HttpBackendApiListenerRule:
     Type: AWS::ElasticLoadBalancingV2::ListenerRule
     DependsOn:
-      - HttpsListener
+      - HttpListener
     Properties:
-      ListenerArn: !Ref HttpsListener
+      ListenerArn: !Ref HttpListener
       Priority: 10
       Conditions:
         - Field: path-pattern
@@ -703,6 +692,98 @@ Resources:
       Actions:
         - Type: forward
           TargetGroupArn: !Ref BackendTargetGroup
+
+  CloudFrontVpcOrigin:
+    Type: AWS::CloudFront::VpcOrigin
+    DependsOn:
+      - LoadBalancer
+    Properties:
+      VpcOriginEndpointConfig:
+        Arn: !Ref LoadBalancer
+        HTTPPort: 80
+        Name: !Sub "${ProjectName}-${Environment}-alb-origin"
+        OriginProtocolPolicy: http-only
+        IpAddressType: ipv4
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ApplicationNoCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub "${ProjectName}-${Environment}-no-cache"
+        MinTTL: 0
+        DefaultTTL: 0
+        MaxTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          CookiesConfig:
+            CookieBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  ApplicationOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub "${ProjectName}-${Environment}-all-viewer-requests"
+        CookiesConfig:
+          CookieBehavior: all
+        HeadersConfig:
+          HeaderBehavior: allViewer
+        QueryStringsConfig:
+          QueryStringBehavior: all
+
+  ApplicationDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${ProjectName}-${Environment} temporary demo"
+        HttpVersion: http2
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        Origins:
+          - DomainName: !GetAtt LoadBalancer.DNSName
+            Id: application-private-alb
+            VpcOriginConfig:
+              VpcOriginId: !Ref CloudFrontVpcOrigin
+              OriginReadTimeout: 30
+              OriginKeepaliveTimeout: 5
+        DefaultCacheBehavior:
+          TargetOriginId: application-private-alb
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
+          CachedMethods:
+            - GET
+            - HEAD
+          CachePolicyId: !Ref ApplicationNoCachePolicy
+          OriginRequestPolicyId: !Ref ApplicationOriginRequestPolicy
+          Compress: true
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: TLSv1.2_2021
+        Restrictions:
+          GeoRestriction:
+            RestrictionType: none
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
 
   PrivateDnsNamespace:
     Type: AWS::ServiceDiscovery::PrivateDnsNamespace
@@ -724,7 +805,7 @@ Resources:
   BackendService:
     Type: AWS::ECS::Service
     DependsOn:
-      - HttpsBackendApiListenerRule
+      - HttpBackendApiListenerRule
       - EcrApiEndpoint
       - EcrDockerEndpoint
       - CloudWatchLogsEndpoint
@@ -763,7 +844,7 @@ Resources:
   FrontendService:
     Type: AWS::ECS::Service
     DependsOn:
-      - HttpsListener
+      - HttpListener
       - EcrApiEndpoint
       - EcrDockerEndpoint
       - CloudWatchLogsEndpoint
@@ -832,8 +913,12 @@ Outputs:
     Value: !Ref BackendSecurityGroup
   LoadBalancerDnsName:
     Value: !GetAtt LoadBalancer.DNSName
+  CloudFrontDistributionId:
+    Value: !Ref ApplicationDistribution
+  CloudFrontDomainName:
+    Value: !GetAtt ApplicationDistribution.DomainName
   ApplicationUrl:
-    Value: !Sub "https://${ApplicationHostname}"
+    Value: !Sub "https://${ApplicationDistribution.DomainName}"
   DatabaseEndpoint:
     Value: !GetAtt Database.Endpoint.Address
   DatabaseSecretArn:
