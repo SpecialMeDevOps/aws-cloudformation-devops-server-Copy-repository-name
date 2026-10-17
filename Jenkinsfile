@@ -341,30 +341,30 @@ pipeline {
             script: 'aws sts get-caller-identity --query Account --output text',
             returnStdout: true
           ).trim()
-          if (!(env.AWS_ACCOUNT_ID ==~ /[0-9]{12}/)) {
+          if (!env.AWS_ACCOUNT_ID.matches('[0-9]{12}')) {
             error('AWS caller identity did not return a 12-digit account ID.')
           }
           def callerArn = sh(
             script: 'aws sts get-caller-identity --query Arn --output text',
             returnStdout: true
           ).trim()
-          if (!(callerArn ==~ /^arn:[^:]+:sts::[0-9]{12}:assumed-role\/.+\/[^\/]+$/)) {
+          if (!callerArn.matches('arn:[^:]+:sts::[0-9]{12}:assumed-role/.+/.+')) {
             error('AWS deployment requires the Jenkins EC2 instance-profile assumed-role identity.')
           }
           env.TF_VAR_jenkins_role_arn = callerArn.replaceFirst(
-            /^arn:([^:]+):sts::([0-9]{12}):assumed-role\/(.+)\/[^\/]+$/,
+            'arn:([^:]+):sts::([0-9]{12}):assumed-role/(.+)/[^/]+$',
             'arn:$1:iam::$2:role/$3'
           )
-          if (!(env.TF_VAR_jenkins_role_arn ==~ /^arn:aws:iam::${env.AWS_ACCOUNT_ID}:role\/.+$/)) {
+          if (!env.TF_VAR_jenkins_role_arn.matches("arn:aws:iam::${env.AWS_ACCOUNT_ID}:role/.+")) {
             error('Could not derive the Jenkins IAM role ARN from the assumed-role identity.')
           }
-          if (!(params.KUBERNETES_OPERATOR_PRINCIPAL_ARN ==~ /^arn:aws:iam::${env.AWS_ACCOUNT_ID}:(role|user)\/.+$/)) {
+          if (!params.KUBERNETES_OPERATOR_PRINCIPAL_ARN.matches("arn:aws:iam::${env.AWS_ACCOUNT_ID}:(role|user)/.+")) {
             error('KUBERNETES_OPERATOR_PRINCIPAL_ARN must be an IAM user or role ARN in the deployment account.')
           }
           if (params.KUBERNETES_OPERATOR_PRINCIPAL_ARN == env.TF_VAR_jenkins_role_arn) {
             error('KUBERNETES_OPERATOR_PRINCIPAL_ARN must be distinct from the Jenkins deployment role.')
           }
-          if (!(params.KUBERNETES_VERSION ==~ /1\.[0-9]{2}/)) {
+          if (!params.KUBERNETES_VERSION.matches('1\\.[0-9]{2}')) {
             error('KUBERNETES_VERSION must be a supported EKS Kubernetes minor version such as 1.34.')
           }
 
@@ -373,14 +373,14 @@ pipeline {
             .collect { it.trim() }
             .findAll { it }
           if (clientCidrs.isEmpty() ||
-              clientCidrs.any { !(it ==~ /(?:[0-9]{1,3}\.){3}[0-9]{1,3}\/(?:[1-9]|[12][0-9]|3[0-2])/) }) {
+              clientCidrs.any { !it.matches('(?:[0-9]{1,3}\\.){3}[0-9]{1,3}/(?:[1-9]|[12][0-9]|3[0-2])') }) {
             error('KUBERNETES_API_ACCESS_CIDRS must contain explicit IPv4 CIDRs with prefixes /1 through /32; /0 is not allowed.')
           }
           def jenkinsEgressIp = sh(
             script: 'curl --fail --silent --show-error --ipv4 https://checkip.amazonaws.com',
             returnStdout: true
           ).trim()
-          if (!(jenkinsEgressIp ==~ /(?:[0-9]{1,3}\.){3}[0-9]{1,3}/)) {
+          if (!jenkinsEgressIp.matches('(?:[0-9]{1,3}\\.){3}[0-9]{1,3}')) {
             error('Could not determine the Jenkins agent public egress IPv4 address.')
           }
           clientCidrs.add("${jenkinsEgressIp}/32")
@@ -463,8 +463,8 @@ pipeline {
             script: "aws ecr describe-images --repository-name '${env.APP_NAME}-backend' --image-ids imageTag='${env.RELEASE_TAG}' --query 'imageDetails[0].imageDigest' --output text",
             returnStdout: true
           ).trim()
-          if (!(frontendDigest ==~ /sha256:[0-9a-f]{64}/) ||
-              !(backendDigest ==~ /sha256:[0-9a-f]{64}/)) {
+          if (!frontendDigest.matches('sha256:[0-9a-f]{64}') ||
+              !backendDigest.matches('sha256:[0-9a-f]{64}')) {
             error('ECR did not return valid image digests; deployment is blocked.')
           }
           env.FRONTEND_IMAGE_URI = "${env.FRONTEND_REPOSITORY_URI}@${frontendDigest}"
